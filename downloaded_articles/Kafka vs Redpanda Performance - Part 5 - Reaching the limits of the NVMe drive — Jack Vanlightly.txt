@@ -1,0 +1,194 @@
+In the [previous](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-
+redpanda-performance-part-4-impact-of-record-keys) post we saw how using
+record keys impacted both Apache Kafka and Redpanda. However, Redpanda
+struggled more than Kafka with the more numerous and smaller sized batches
+that result from key-based partition distribution.
+
+Next I decided to see if I could get Apache Kafka and Redpanda to reach the
+absolute limit of the NVMe drive throughput on the i3en.6xlarge - 2 GB/s. To
+do this I deployed both systems without TLS and modified the Redpanda 1 GB/s
+benchmark to attempt 2 GB/s, use 10 producers/consumers and use acks=1 instead
+of acks=all.
+
+# Reaching 2 GB/s
+
+The result was that Kafka ended up just short at around 1900 MB/s and Redpanda
+maxed out at 1400 MB/s. I decided to run a multiple step test starting at 1000
+MB/s and incrementing by 200 MB/s until it reached 2000 MB/s.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/ae39384d-94e4-417f-9136-b3fa32d5c55f/1-2-GBs-
+throughput.png)
+
+Fig 1. With acks=1, Kafka reaches 1900 MB/s but Redpanda tops out at 1400
+MB/s.
+
+For Kafka I added an additional step for 1900 MB/s to see the e2e latency at
+its throughput limit. Looking at the Kafka metrics, I saw that the 1900 MB/s
+throughput workload translated to 1 GB/s per NVMe drive (2 GB/s in aggregate)
+which is the limit of these drives. 1900 MB/s translated to 2 GB/s due to
+indexes causing a small write-amplification where we write to disk a little
+more than we transmit over the network.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/2ff758e9-39da-4c9b-a8fc-27274db27671/kafka-
+drive-writes-1000-1900MB.png)
+
+Fig 2. Kafka reaches the absolute NVMe drive limit at the 1900 MB/s test and
+continues to max it out when trying to reach 2000 MB/s throughput.
+
+Kafka was able to completely saturate the NVMe drives.
+
+Redpanda reached a maximum throughput of 1.5 GB/s across the RAID-0, or 750
+MB/s per drive, leaving some drive throughput left on the table.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/1407b258-13d3-4c3f-b51e-90be98e6eb40/redpanda-
+drive-throughput-1000-2000MB.png)
+
+Fig 3. Redpanda could not reach the NVMe drive limit.
+
+Kafka managed reasonable end-to-end latency up to the physical limit of 1900
+MB/s (which was 2 GB/s on disk).
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/fa58c89b-ebf4-456a-ba01-152bf88c660c/acks1_1000-1900MB_AllWorkloadsEndtoEndLatencyPercentilesUpTo999.png)
+
+Fig 4. Kafka end-to-end latencies, up to p99.9, at different throughputs, from
+1000 MB/s to 1900 MB/s.
+
+End-to-end remained sub-second for all latencies, including the p100 of the
+3.5 billion messages sent during the 30 minute 1900 MB/s test.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/6f20ae6d-f19b-4f28-be2f-bd53ec1d9c9f/acks1_1000-1900MB_AllWorkloadsEndtoEndLatencyPercentilesall.png)
+
+Fig 5. Kafka end-to-end latencies, up to p100, at different throughputs, from
+1000 MB/s to 1900 MB/s.
+
+## Comparing end-to-end latencies at 1000 and 1200 MB/s
+
+If we compare Kafka to Redpanda on the throughputs that Redpanda managed with
+low end-to-end latencies (1000 and 1200 MB/s), we see Redpanda had the edge.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/1d83baf0-e74f-4e78-84c7-4b616211a139/kafka-
+vs-redpanda-e2elat-1000-1200MB.png)
+
+Fig 5. Redpanda achieved lower end-to-end latency than Kafka on the lower
+throughput tests of 1000 and 1200 MB/s.
+
+The end-to-end latencies of Redpanda were very good, but I was curious to
+rerun the test with a 1 hour retention limit (3.5 TB) and see if the end-to-
+end latencies changed at all. As we saw in a previous post, Redpanda end-to-
+end latencies are higher once the data retention limit has been reached.
+
+On a Redpanda broker I ran.
+
+    
+    
+    rpk cluster config set retention_bytes 12500000000
+    rpk cluster config set delete_retention_ms 3600000
+    
+
+I ran the 1000 and 1200 MB/s tests, with a 1 hour warm-up in order to reach
+the retention limit. After 1 hour, the benchmark worker would start recording
+end-to-end latency metrics.
+
+As usual there was the step increase in end-to-end latencies once retention
+kicked in.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/ea853d1f-19f8-4b6f-820f-f0c637034a92/redpanda-
+ret-limit-1000-1200MB.png)
+
+Fig 6. The usual Redpanda step increase in end-to-end latency once the brokers
+start actively deleting segment files. Each test was two hours with a one hour
+retention limit.
+
+When we compare the percentile charts, we see the retention limits tests with
+much higher latency results.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/681d96e8-cc4d-4eaf-abfc-
+dad6b7090ae0/redpanda-none-vs-ret-limit.png)
+
+Fig 7. End-to-end latencies are markedly higher when we measure latency once
+data retention limits are enforced.
+
+Comparing to Kafka, the end-to-end latency chart still put Redpanda slightly
+ahead of Kafka but the gap was much lower.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/1922b2ad-2915-49be-b0b9-05e046b4f562/acks1-AK_RP-
+RetLimt_AllWorkloadsEndtoEndLatencyPercentilesall.png)
+
+Fig 8. Once data retention is included, the Redpanda advantage was much
+smaller.
+
+# Conclusions
+
+Ironically it was only Kafka that was able to fully utilize the hardware in
+this test, totally maxing out the NVMe drives with a 2 GB/s disk write rate.
+Redpanda reached a bottleneck somewhere but it wasn’t obvious what that might
+have been.
+
+At the lower throughput of 1000 and 1200 MB/s, which Redpanda did manage, it
+showed better end-to-end latencies than Kafka though this lead was greatly
+reduced once we took into account the retention limit issue.
+
+# How to run this test
+
+Things you’ll need to do to run this test:
+
+  1. Deploy a non-TLS cluster. 
+
+  2. Take the standard Redpanda benchmark and increase the producer rate to reach 2 GB/s.
+
+  3. Ensure the driver file referenced from the workload script uses acks=1.
+
+  4. For Redpanda you should also set the retention limit as described above and ensure the `warmupDurationMinutes` field in the workload file is larger than the retention limit.
+
+You can also find instructions in my OMB repo
+[here](https://github.com/Vanlightly/openmessaging-benchmark-
+custom/tree/main/blog/kafka-vs-rp/part5-reaching-2GBs).
+
+In the [next](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-
+redpanda-performance-part-6-draining-backlogs) post we’ll run tests where we
+allow consumer lag to build up and then time how long it takes for consumers
+to catch-up, while producer load is maintained.
+
+Series links:
+
+  * [Kafka vs Redpanda performance - Do the claims add up?](https://jack-vanlightly.com/blog/2023/5/15/kafka-vs-redpanda-performance-do-the-claims-add-up)
+
+  * [Kafka vs Redpanda performance - Part 1 - 4 vs 50 producers](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-1-4-vs-50-producers)
+
+  * [Kafka vs Redpanda performance - Part 2 - Long running tests](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-2-long-running-tests)
+
+  * [Kafka vs Redpanda performance - Part 3 - Hitting the retention limit](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-3-hitting-the-retention-limit)
+
+  * [Kafka vs Redpanda performance - Part 4 - The impact of record keys](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-4-impact-of-record-keys)
+
+  * Kafka vs Redpanda performance - Part 5 - Reaching the NVMe drive limit
+
+  * [Kafka vs Redpanda performance - Part 6 - Draining backlogs](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-6-draining-backlogs)
+

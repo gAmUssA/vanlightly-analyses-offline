@@ -1,0 +1,333 @@
+In [part 1](https://jack-vanlightly.com/analyses/2024/1/23/serverless-
+clickhouse-cloud-asds-chapter-5-part-1) we looked at the open-source
+ClickHouse architecture, in part 2 we dive into the serverless architecture of
+ClickHouse Cloud.
+
+  * [Part 1 - A mental mode for OSS ClickHouse](https://jack-vanlightly.com/analyses/2024/1/23/serverless-clickhouse-cloud-asds-chapter-5-part-1)
+
+  * Part 2 - Serverless ClickHouse Cloud (this part)
+
+# The serverless ClickHouse architecture
+
+ClickHouse Cloud is an entirely serverless offering of ClickHouse that uses a
+new MergeTree engine called the SharedMergeTree. Where a traditional on-
+premise ClickHouse cluster is composed of a set of monolithic servers that do
+both query processing and storage, CH Cloud servers separate storage and
+compute, with the servers being stateless compute instances and storage served
+solely by cloud object storage. The SharedMergeEngine is at the core of this
+serverless architecture.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/8a921564-1fa6-4e95-a2e6-df721329136d/SharedMergeTree.png)
+
+## The SharedMergeTree engine
+
+The SharedMergeTree engine differs from the MergeTree and ReplicatedMergeTree
+engines in a few key ways.
+
+This engine replicates data and metadata to object storage and keepers only;
+replicas do not directly communicate with each other. This turns a shared-
+nothing architecture, where certain data lives on certain servers, into a
+shared-everything architecture, where all servers share the same storage layer
+(object storage).
+
+The SharedMergeTree engine only uses local disks for ephemeral data, such as
+caches. All durable data is written to object storage and the keepers
+directly.
+
+No sharding is necessary as the storage layer is massively scalable hyper-
+scaler object storage rather than a discrete set of cloud compute instances
+with disks. Sharding is the recommended way to serve large datasets that
+exceed the size of a single machine, however, cloud object storage is
+essentially infinite in size, so sharding is not necessary. Query serving is
+scaled by adding more CH Cloud servers and/or scaling up the existing servers.
+Reads and writes can go to any server across this single shard, and ClickHouse
+Cloud reports that a cluster will scale linearly with the number/size of
+servers, given that the keepers are adequately scaled.
+
+Keeper scaling is a key point as the keeper cluster must be able to cope with
+the aggregate load of part log dissemination. The keepers will feel pressure
+not only from the volume of part metadata they receive but the fan-out of that
+log to the replicas. ClickHouse Keeper was developed to replace ZooKeeper in
+order to boost performance, and [future work is being
+discussed](https://github.com/ClickHouse/ClickHouse/issues/54172) to add
+sharding to ClickHouse Keeper to allow it to scale further.
+
+On-the-fly mutations (aka lightweight updates) provide a lower-latency
+mechanism for performing mutations. On-the-fly mutations don’t overly change
+the underlying mutation logic - parts still must be rewritten in batches
+asynchronously, but metadata about the mutations are disseminated with peer
+replicas via the keepers, which store the mutations in memory where they are
+applied on the fly during query execution (until the mutations are applied by
+rewriting of the affected parts).
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/c1cc28b6-3fdb-4abf-8937-6e7b4d70d1b2/SharedMergeTreeSequence.png)
+
+The job of part-merging is distributed across all table replicas as it is with
+the ReplicatedMergeTree engine, coordinated through compare-and-swap on the
+version of data parts metadata in the Keepers.
+
+I don’t know all the details of the SharedMergeTree implementation as it is
+closed-source but ClickHouse Cloud does publicly discuss some details in their
+SharedMergeTree announcement blog:
+
+> “ _Note that ClickHouse Cloud services feature a multi-layer_[ ___read-
+> through_](https://en.wiktionary.org/wiki/read-through) _and_[ ___write-
+> through_](https://en.wikipedia.org/wiki/Cache_\(computing\)#WRITE-THROUGH)
+> _cache (on local_[ ___NVM_](https://en.wikipedia.org/wiki/Non-
+> volatile_memory) _e SSDs) that is designed to work natively on top of object
+> storage to provide fast analytical query results despite the slower access
+> latency of the underlying primary data store. Object storage exhibits slower
+> access latency, but provides highly concurrent throughput with large
+> aggregate bandwidth. ClickHouse Cloud exploits this by_[
+> ___utilizing_](https://clickhouse.com/docs/knowledgebase/async_vs_optimize_read_in_order#asynchronous-
+> data-reading) _multiple I/O threads for accessing object storage data, and
+> by asynchronously_[ ___prefetching_](https://clickhouse.com/docs/en/whats-
+> new/cloud#performance-and-reliability-3) _the data._ ”
+> [https://clickhouse.com/blog/clickhouse-cloud-boosts-performance-with-
+> sharedmergetree-and-lightweight-updates#sharedmergetree-for-cloud-native-
+> data-processing](https://clickhouse.com/blog/clickhouse-cloud-boosts-
+> performance-with-sharedmergetree-and-lightweight-updates#sharedmergetree-
+> for-cloud-native-data-processing).
+
+This prefetch strategy is likely to be highly effective for workloads that
+require sequential table scans but less effective for queries based on small
+random seeks. There are many further options for mitigating the higher object
+storage latency, such as various types of caching (including [query result
+caching](https://clickhouse.com/blog/introduction-to-the-clickhouse-query-
+cache-and-design)) and pre-aggregation via aggregation-based engines,
+materialized views, and projections. ClickHouse gets a certain degree of
+freedom regarding the latency introduced by object storage as it was designed
+for analytical queries rather than low-latency OLTP.
+
+The open-source ClickHouse uses a buffer abstraction that allows for prefetch
+via double-buffering though it is not clear if the SharedMergeTree uses this
+same abstraction or a more sophisticated one more highly optimized for cloud
+object storage. It would make sense to do so as the SharedMergeEngine was
+purposely built to use object storage as its storage layer.
+
+Another question that arises is whether the SharedMergeTree engine makes of of
+a customized columnar file format, more suited to cloud object storage. As
+detailed in section 5.4 of the excellent paper, [An Empirical Evaluation of
+Columnar Storage Formats](https://arxiv.org/pdf/2304.05028.pdf), the authors
+note that other columnar file formats have some disadvantages in cloud object
+storage environments due to multiple rounds trips required to read file
+metadata. Storage layout optimizations that provide better mechanical sympathy
+for high throughput, high latency object storage are worth exploring for
+object-storage-based query engines.
+
+Whether the ClickHouse file format already avoids these issues or not I don’t
+know. Indexes are stored in memory and point directly to offsets in bin files
+(via the mark files). The mark files are not always stored in memory, however,
+mark files do get cached on disk and smart caching would do well to actively
+download mark files to reduce the number of GET requests required when data
+must be fetched on-demand from column data files. It would be interesting to
+dive deeper into this topic of optimizing ClickHouse storage for S3. If I ever
+get any specifics on optimizations that ClickHouse Cloud makes then I will add
+it here. When your storage engine is purpose built for object storage, it
+would make sense to optimize the file format for that more specialized use
+case.
+
+Finally, regarding consistency, this is somewhat tuneable by the user. Inserts
+are consistent in the sense that the operation is only confirmed when the part
+has been written to object storage and the part metadata is written to the
+keepers. Updates can be performed either asynchronously or synchronously, with
+the on-the-fly mutations allowing for lower-latency synchronous updates (while
+the parts get rewritten asynchronously). Finally, the keywords FINAL and SYNC
+REPLICA can be used to ensure consistent reads. FINAL will perform
+deduplication before serving a result, and SYNC REPLICA will ensure the
+replica reads the latest metadata before acting on a select query.
+
+## Multi-tenancy
+
+As outlined in the [introductory chapter](https://jack-
+vanlightly.com/blog/2023/11/14/the-architecture-of-serverless-data-systems),
+the hurdles associated with serverless multi-tenancy revolve around achieving
+optimal resource utilization while upholding robust isolation among tenants.
+In the forthcoming sections, I will delve into these challenges, focusing on
+both the compute and storage layers.
+
+### Compute layer
+
+As already covered, ClickHouse Cloud servers are stateless compute nodes that
+use cloud storage as their durable storage layer, with caching and prefetching
+to mitigate cloud storage latency issues. These stateless nodes are deployed
+in per-tenant pods scheduled on a K8s cluster. Multi-tenancy is achieved by
+bin-packing multiple tenant pods onto each K8s host.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/11e09824-7710-4130-bedd-b330ce26872e/ServerlessArchitecture.png)
+
+There is no sharding in this shared-everything architecture, so scaling is
+achieved by either scaling up and/or scaling out the compute nodes. The
+leaderless architecture of ClickHouse (both SharedMergeTree and open-source)
+is a key factor for ClickHouse scalability. Each server can accept both reads
+and writes for a given table, with the SharedMergeTree engine and the Keepers
+working together to disseminate the existence of new parts.
+
+Auto-scaling is coordinated between three different components:
+
+  * Idler: suspends pods that are not receiving queries.
+
+  * Scaler: ensures there is enough pod capacity (up to an upper limit) to serve the query load.
+
+  * Proxies: responsible for notifying the scaler when queries arrive for a scaled-to-zero tenant. ClickHouse refers to the [KNative Activator](https://knative.dev/docs/serving/architecture/#diagram) as inspiration, though both Neon and CockroachDB use essentially the same pattern of a proxy which buffers requests and notifies the auto-scaler to provision a pod.
+
+Tenants can choose whether the cluster gets scaled to zero when idle. Other
+serverless systems that scale to zero reduce cold starts by keeping a pool of
+blank pods running which can be rapidly “stamped” with the identity of a
+tenant - though ClickHouse makes no mention of this strategy (specifically
+regarding pods).
+
+ClickHouse Cloud uses a custom K8s scheduler to optimize hardware utilization,
+as described in [this blog post](https://clickhouse.com/blog/packing-
+kubernetes-pods-more-efficiently-saving-money). The default K8s pod scheduler
+uses a LeastAllocated scoring strategy which aims to balance load evenly
+across the cluster hosts. This seems a reasonable strategy as it reduces hot
+spots caused by over-allocating pods on a given host. However, while it would
+achieve this goal, it also works against optimizing hardware utilization. With
+fluctuating aggregate load, the service should scale in and scale out the
+underlying K8s hosts accordingly. The problem is that the LeastAllocated
+strategy makes host scale-in unlikely, as all hosts will be allocated a
+relatively balanced number of pods. Hosts are scaled-in when CPU and memory
+utilization drop below a certain threshold, reaching this threshold is less
+likely with a LeastAllocated strategy.
+
+The MostAllocated strategy solves this problem by ensuring that new pods get
+scheduled on a host with enough spare CPU and memory capacity for the pod but
+are ranked as the most allocated in terms of CPU and memory shares. Over time,
+the least allocated host will gradually become empty of ClickHouse pods, and
+once the last ClickHouse pod is terminated, the resource utilization should
+drop below the threshold and the cluster autoscaler can take the host offline.
+
+However, scaling down the K8s hosts to exactly match aggregate load introduces
+latency issues when aggregate load increases again and a new K8s host must be
+provisioned. This provisioning time can be relatively long and many newly
+scheduled pods can be stuck pending the availability of the new host. This
+problem is mitigated by overprovisioning the hosts, such that there are extra
+hosts ready to take on new pods should load increase. This trades off higher
+costs for lower pod scheduling latency.
+
+ClickHouse reported increasing hardware utilization from 50% to 70% with these
+K8s scheduler changes. I recommend the [blog
+post](https://clickhouse.com/blog/packing-kubernetes-pods-more-efficiently-
+saving-money), which covers this in more detail with EKS and Kubernetes
+specific details. For this write-up, it is the general pattern of using a
+MostAllocated strategy with host overprovisioning that I find most valuable.
+
+### Storage layer
+
+Serverless systems that use a storage layer based on disks usually implement
+some kind of sharding mechanism along with data rebalancing to avoid hot spots
+from causing quality of service degradation. ClickHouse Cloud sidesteps the
+need for these strategies by utilizing cloud object storage as its sole
+(durable) storage layer. Heat management becomes the preserve of the hyper-
+scaler rather than ClickHouse Cloud. Like any system, a degree of mechanical
+sympathy is required, but there are no operations like data rebalancing
+needed.
+
+This leads us to the next insight that I want to underline. Typically in
+serverless, multi-tenant data systems, tenants are oversubscribed in order to
+reach high resource utilization. However, this is mostly true of systems that
+have a stateful component, as the data of multiple tenants must be stored over
+the long term. S3 itself oversubscribes tenants in order to maximize resource
+utilization. The complication of oversubscription is that, as I just
+mentioned, heat management becomes a real concern, with a lot of work and
+complexity going into effectively managing hotspots that can arise. Just look
+at the heat management sections in the chapters on [Serverless
+CockroachDB](https://jack-vanlightly.com/analyses/2023/11/21/serverless-
+cockroachdb-asds-chapter-4-part-3), [DynamoDB](https://jack-
+vanlightly.com/analyses/2023/11/14/amazon-dynamodb-asds-chapter-1), and
+Confluent’s [Kora](https://jack-vanlightly.com/analyses/2023/11/14/kora-
+serverless-kafka-asds-chapter-2) engine, which all have stateful components
+(due to their more stringent latency requirements). However, a stateless
+elastic architecture built on someone else’s storage service does away with
+the need to oversubscribe tenants. Pods are allocated dynamically based on
+load and when there is no load at all, the system can scale a tenant to zero.
+The data lives on but in someone else’s service (the hyper-scaler).
+
+This is why I [described](https://jack-
+vanlightly.com/blog/2023/11/29/s3-express-one-zone-not-quite-what-i-hoped-for)
+cheap, durable, and low-latency object storage being the holy grail for cloud
+data systems of all types (including low-latency systems) - and how despite
+the recent release of S3 Express One Zone, some of us system builders are
+still waiting for that grail moment to arrive. As William Gibson wrote: “ _The
+future is here, it’s just not evenly distributed_ ”. For ClickHouse, it seems
+that future has mostly arrived due to the more lenient latency constraints of
+an analytics workload.
+
+## Resource utilization pricing model
+
+There are many pricing models for serverless data systems, including charging
+per (million) requests, GB of storage, virtual capacity units, or hardware
+resources utilized.
+
+Models such as charging per request do not suit an analytics use case well due
+to the wildly different amount of work that one query may require compared to
+another. ClickHouse Cloud opted for a resource utilization model based on
+storage and compute, as it maps well to the unpredictable resource utilization
+of analytical workloads.
+
+# Conclusions
+
+The ClickHouse storage architecture based on immutable _parts_ maps extremely
+well to cloud object storage, where objects are also immutable. Data and
+indexes are packaged up inside these parts, so it comes down to optimizing the
+logistics of _part_ writing, reading, merging, and dissemination, using
+parallelization at all levels (in-process and across processes). Servers write
+immutable parts to object storage and broadcast the existence of new parts via
+the keepers. Peer servers subscribe to the part feed and can immediately
+obtain the index files for new parts, storing them in memory while data files
+can be pulled in on demand (with heavy use of prefetching). Meanwhile, all
+replicas can coordinate to share the load of part merging. All this work, from
+multi-stage query pipelines to merging, is highly parallelizable. The
+immutable _part_ is king in the ClickHouse architecture.
+
+This part-oriented architecture doesn’t come for free, there are always trade-
+offs. The main trade-off I see with packaging everything (data, primary and
+secondary indexes) in immutable parts is less efficiency of workloads with
+varied queries that do not necessarily align well with the primary key. The
+lack of potent secondary indexes (due to being packaged in sorting key
+organized parts) also comes under this trade-off. Materialized views and
+projections help a lot here, though at an increased cost in storage, insert
+cost and merge cost. The bigger the dataset, the more pronounced these trade-
+offs would become apparent.
+
+However, the part-oriented architecture is clearly an elegant design decision
+for building an object storage engine such as the SharedMergeTree. The
+architecture of horizontally scalable stateless replicas with no inter-replica
+communication built on top of a highly scalable cloud storage service is
+perfect for serverless. Avoiding the data sharding and rebalancing that comes
+with a storage layer reduces the complexity of the overall system massively, a
+fact reflected in ClickHouse Cloud’s achievement of releasing a serverless
+data product in a year.
+
+ClickHouse epitomizes the kind of workload that was made for object storage:
+
+  * Large datasets.
+
+  * Lenient latency requirements (S3 standard in the synchronous hot path for inserts is fine, waiting on the downloading of parts from S3 standard for select queries is fine).
+
+  * Lenient consistency (most users probably don’t need consistency and don’t routinely use SYNC REPLICA).
+
+  * Lots of large sequential scans, fewer tiny random seeks.
+
+Finally, it’s worth noting the absence of the need to talk in detail about
+performance isolation. Little mention of admission control beyond
+foreground/background work scheduling and no data rebalancing at all. These
+complexities are mostly gone with this architecture of elastic stateless
+compute nodes deployed in K8s pods (with resource limits), built atop scalable
+cloud object storage where heat management is someone else’s problem.
+ClickHouse Cloud illustrates why object storage is so attractive to data infra
+projects/companies, the question is: when will object storage become both
+[low-latency and cheap](https://jack-
+vanlightly.com/blog/2023/11/29/s3-express-one-zone-not-quite-what-i-hoped-for)
+so that it can become the default storage layer for all?
+

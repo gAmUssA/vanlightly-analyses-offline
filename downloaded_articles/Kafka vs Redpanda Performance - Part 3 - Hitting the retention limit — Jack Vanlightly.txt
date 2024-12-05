@@ -1,0 +1,135 @@
+In the [last post](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-
+redpanda-performance-part-2-long-running-tests) we saw that Redpanda
+performance degraded over time and that we needed to include a certain amount
+of drive over-provisioning to cope with the random IO nature of Redpanda. In
+this post we’re going to look at a phenomenon I see in every high throughput
+test I run which reaches the retention limit.
+
+## Hitting the retention limit
+
+Retention limits exist in event streaming systems as without them, the disks
+would fill up and the servers would crash. Even when using tiered storage, we
+need to have a local retention limit.
+
+When I ran the Redpanda tests for long enough to reach the retention limit, I
+saw a strange stepwise increase in latency. The size of the step seems to be
+affected by the amount of disk used and the throughput of the test. Low
+throughput tests didn’t exhibit the behavior, but the medium and high
+throughput ones did.
+
+In the case below, retention limits were reached at just before 22:00.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/b401c1ad-3fed-4b4d-8da2-a95c51cad934/rp-
+ret-limit-p50.png)
+
+Fig 1. The Redpanda stepwise increase is less pronounced in p50-p90, but
+visible.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/ca34843e-007f-4dc7-8e4f-c3588d8efa37/rp-
+ret-limit-p95.png)
+
+Fig 2. The stepwise increase becomes significant from p95.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/eb473963-844e-4066-a6e4-dee659467f9c/rp-
+ret-limit-p9999.png)
+
+Fig 3. The stepwise increase remains proportionally around the same at the
+high tail latencies.
+
+## Drive space utilization
+
+The following chart shows the end of one test and the start of another. The
+first test used up to 20% of the drive when retention limits kicked in (3TB)
+and the second was configured to use up to 50% of the drive (7.5TB). We see
+that the tail latencies when retention kicked in are higher with 50% retention
+compared to 20% retention. The more full the drive, the more intense the
+increase in latency.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/08edff81-e4d7-4e64-ae3d-9f229f2c9e95/rp-
+ret-limit-20-50.png)
+
+Fig 4. On the left we see the end of the 20% test. The middle is the 50% test,
+but the retention size has not been reached yet. The right-hand size is where
+the retention limit kicks in for the 50% retention size limit.
+
+All Apache Kafka tests showed absolutely no impact on latency when retention
+limits kicked in. Likewise I have not seen this behaviour with Apache
+BookKeeper either.
+
+The implications of this are that all Redpanda benchmarks should be run once
+retention has already kicked in.
+
+# Rerunning tests at the retention limit
+
+Unfortunately for me most of my results were obtained before I made this
+discovery. However, I did run the 1 GB/s benchmark again with different sized
+retention limits.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/89f1b09e-89ee-497d-9af7-05d7281b3874/rp-
+ret-limit-retest.png)
+
+Fig 5. The impact of data retention on end-to-end latencies for the 1 GB/s
+Redpanda benchmark (without TLS in this case).
+
+# Conclusions
+
+Redpanda seems to be very sensitive to drive latency. The extra burden of
+deleting segment files has a large impact on end-to-end latency. This effect
+manifested on the higher throughput tests and is not guaranteed on low
+throughput workloads. If you are considering running Kafka vs Redpanda
+benchmarks, do remember to measure performance of a cluster that has already
+reached its retention limit and is actively deleting segment files - this is
+easily achieved with OMB as I describe in the next section.
+
+It does seem that Redpanda gets its best results on short tests, before random
+IO exerts an impact on the NVMe drive and before data retention kicks in.
+
+# How to run this test
+
+Obtaining results once a cluster has already reached the retention limit is
+achieved by doing the following:
+
+  1. Set the retention limit in Redpanda. On any Redpanda broker instance run `rpk cluster config set delete_retention_ms <ms here>` or limit by space per partition using `rpk cluster config set retention_bytes <bytes here>`
+
+  2. In the OMB workload file, set _warmupDurationMinutes_ to a value large enough so that OMB is still in the warm-up phase when the retention limit is reached. Latencies are only recorded after the warm up is complete.
+
+You can also see instructions in my [OMB
+repo](https://github.com/Vanlightly/openmessaging-benchmark-
+custom/tree/main/blog/kafka-vs-rp/part3-retention-limit).
+
+[Next](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-
+performance-part-4-impact-of-record-keys) we’ll look at a workload that is
+more common than anything we have run so far - using record keys to achieve
+message ordering.
+
+Series links:
+
+  * [Kafka vs Redpanda performance - Do the claims add up?](https://jack-vanlightly.com/blog/2023/5/15/kafka-vs-redpanda-performance-do-the-claims-add-up)
+
+  * [Kafka vs Redpanda performance - Part 1 - 4 vs 50 producers](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-1-4-vs-50-producers)
+
+  * [Kafka vs Redpanda performance - Part 2 - Long running tests](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-2-long-running-tests)
+
+  * Kafka vs Redpanda performance - Part 3 - Hitting the retention limit
+
+  * [Kafka vs Redpanda performance - Part 4 - The impact of record keys](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-4-impact-of-record-keys)
+
+  * [Kafka vs Redpanda performance - Part 5 - Reaching the NVMe drive limit](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-5-reaching-the-limits-of-the-nvme-drive)
+
+  * [Kafka vs Redpanda performance - Part 6 - Draining backlogs](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-6-draining-backlogs)
+

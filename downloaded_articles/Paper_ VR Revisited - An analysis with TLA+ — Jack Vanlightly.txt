@@ -1,0 +1,119 @@
+A couple of weeks ago I got nerd sniped into writing a TLA+ specification for
+the [Viewstamped Replication Revisited
+paper](https://pmg.csail.mit.edu/papers/vr-revisited.pdf). I have written
+specifications for multiple variants of Raft, Apache BookKeeper, SWIM, Kafka
+replication, Kafka consumer group protocol, RabbitMQ streams replication and
+many more including some protocols that are not publicly available. But VR
+Revisited has been more challenging than most, not because it is more complex,
+but because the paper is hard to interpret.
+
+I read and re-read the sections on normal operations, view changes, state
+transfer and replica recovery as I kept having questions I couldn’t easily
+answer. When it came time to putting TLA+ to paper I encountered issues
+because the text was at times too vague to be sure what the exact behaviour
+should be and at times seemed to be contradictory.
+
+So, in order to unblock myself, I decided to write an analysis of the paper -
+documenting my questions and doubts as I go, describing how I resolve these
+doubts as well as describing any defects or nuance I find. My tool of choice
+for designing and analysing distributed system protocols is TLA+ along with
+its model checker TLC.
+
+I hope that this analysis is useful to some who want to understand VR
+Revisited in more detail and desire more rigor than the paper provides.
+
+## Quick VR Revisited Overview
+
+[Viewstamped Replication Revisited](https://pmg.csail.mit.edu/papers/vr-
+revisited.pdf) is a state-machine replication (SMR) protocol and a revision of
+the original [Viewstamped Replication
+paper](http://pmg.csail.mit.edu/papers/vr.pdf).
+
+In VR Revisited, each node is known as a replica. Each replica consists of two
+modules: a replication module responsible for replicating the log of
+operations and a state-machine module responsible for applying the operations
+to some arbitrary application state.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/2d9755fc-7268-4e81-838b-5547cf460635/SMR.png)
+
+Fig 1. State-machine replication
+
+At its core, it is very similar to Raft and multi-Paxos in that it relies on
+overlapping replication and election quorums to ensure that committed
+operations survive leadership changes.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/5e7a0495-8f7c-4c2d-81c6-6ac39ee50931/Overlapping-
+quorums.png)
+
+Fig 2. No matter the cluster size, all majority quorums overlap. In other
+words, there does not exist two majority quorums that do not overlap.
+
+The most immediate difference from Raft and multi-Paxos are how leadership
+changes are performed. Instead of leaders being elected via majority votes
+where any up-to-date node can win, leaders are elected by majority agreement
+on the current view-number. View-numbers map to replicas and for any given
+view-number only one replica can be the primary (leader). Leadership changes
+are therefore called View Changes.
+
+VR Revisited also includes additional sub-protocols that give it extra
+capabilities that are not included in vanilla Raft/Paxos:
+
+  1. Client operation ordering and deduplication. Clients can perform a sequence of operations, across view-changes and failures with ordering and deduplication guarantees.
+
+  2. No requirement to persist operations to stable storage, and if written to stable storage, operations can be written asynchronously - this is attractive for performance. Raft for example, requires that entries confirmed by a node are persisted to disk synchronously as the guarantees do not hold under arbitrary data loss. VR Revisited achieves this capability via a recovery sub-protocol that guarantees that a replica only re-joins a cluster as a fully functioning member once it has recovered at least as much data as it had when it crashed.
+
+Note that both the above capabilities can be added to other protocols such as
+Raft and interestingly, close to my heart, both have equivalents in Apache
+Pulsar and Apache BookKeeper.
+
+Apache Pulsar and Apache Kafka offer producer ordering guarantees and
+deduplication, across topic leader changes via a mechanism similar to VR
+Revisited client tables.
+
+Apache BookKeeper is able to run without its journal by implementing a
+recovery sub-protocol that guarantees a BK node only becomes a fully
+functioning member once it has recovered all operations it had previously
+confirmed. While the protocol is very different due to BK using a very
+different replication protocol, the underlying property of re-joining without
+missing entries is the same.
+
+There may be additional capabilities of VR Revisited that I have missed but
+once I have written all the sub-protocols in TLA+ I will finish off by taking
+a step back and asking questions such as:
+
+  * Why choose VR Revisited over Raft or Paxos?
+
+  * Do additional innovations to the protocol exist in real-world implementations?
+
+## TLA+
+
+This analysis uses TLA+ and its model checker. If you are new to TLA+ then I
+wrote an [introduction to its concepts](https://medium.com/splunk-
+maas/detecting-bugs-in-data-infrastructure-using-formal-methods-704fde527c58)
+as part of my write-up on how I found a defect in Apache BookKeeper with TLA+.
+Plus there is always the excellent [TLA+ video
+course](https://www.youtube.com/@tlavideocourse8540) by Leslie Lamport
+himself.
+
+## Analysis Parts
+
+  1. [View changes - Questions](https://jack-vanlightly.com/analyses/2022/12/20/paper-vr-revisited-view-change-questions-part1) (Part 1)
+
+  2. [View changes - Answers](https://jack-vanlightly.com/analyses/2022/12/12/22/paper-vr-revisited-view-change-answers-part2) (Part 2)
+
+  3. [State transfer](https://jack-vanlightly.com/analyses/2022/12/28/paper-vr-revisited-state-transfer-part-3) (Part 3)
+
+  4. [Application state and commit-number monotonicity](https://jack-vanlightly.com/analyses/2023/01/01/paper-vr-revisited-application-state-and-commit-number-monotonicity-part-4) (Part 4)
+
+  5. [Basic and log-suffix replica recovery](https://jack-vanlightly.com/analyses/2023/01/17/paper-vr-revisited-log-based-replica-recovery-part-5) (Part 5) 
+
+  6. [Checkpoint-based replica recovery](https://jack-vanlightly.com/analyses/2023/01/22/paper-vr-revisited-checkpoint-based-replica-recovery-part-6) (part 6)
+
+  7. Reconfiguration - coming soon
+

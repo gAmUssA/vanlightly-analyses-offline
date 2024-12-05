@@ -1,0 +1,288 @@
+In part 3, the focus is on heat management (the mitigation of hot spots in the
+storage layer) and autoscaling in the compute layer. In part 2 we looked at
+the Admission Control sub-system of CRDB and how it helps prevent node
+overload and noisy neighbors.
+
+Chapter 4 parts:
+
+  * [Part 1 - Architecture overview](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-1)
+
+  * [Part 2 - Admission control](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-2)
+
+  * [Part 3 - Heat management and autoscaling](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-3)
+
+## Heat management
+
+CRDB uses the combination of sharding, shard movement, and lease distribution
+to avoid hot spots in its shared storage layer.
+
+Load distribution in the storage layer is performed at two levels:
+
+  1. Leaseholder rebalancing, which only attempts to balance the leaseholders over the storage nodes. This is a cheap form of load balancing as it does not involve data movement, only the moving leases between replicas.
+
+  2. Load-based replica rebalancing which moves replicas across storage nodes based on node-level load metrics.
+
+Leaseholder rebalancing does not take into account the load on any given range
+and therefore, it alone is not enough to balance load across the storage
+nodes. Leaseholder rebalancing is only effective because CRDB tries to reduce
+the amount of load skew between ranges via size and load-based range
+splitting/merging. This allows a cluster to use leaseholder distribution as a
+cheap first strategy for load distribution.
+
+However, if a node still receives excessive load, replica rebalancing kicks
+in, which moves replicas from overloaded nodes to less loaded nodes (data
+rebalancing).
+
+### Sharding strategies
+
+CRDB offers two main sharding strategies:
+
+  * Contiguous ranges of keyspace (primary key/index key)
+
+  * Contiguous ranges of hash space (based on the hash of the primary/index key).
+
+The default sharding mechanism in CRDB is known as range partitioning: the
+splitting of the keyspace of a table or secondary index into contiguous ranges
+where each range corresponds to a Raft group. This works well where the read-
+and-write access pattern touches all ranges. If any given range grows too
+large or receives excessive load, it is split. Likewise, as ranges shrink
+and/or receive less load, they can be merged. However, this strategy is not
+always effective. When a primary key or an index key is a sequential counter
+(or timestamp), all writes always focus on a single range making the last
+range a write hot spot.
+
+This sequential write workload results in poor performance for a couple of
+reasons:
+
+  1. All writes go to the same Raft group, limiting the scalability of the table.
+
+  2. Range splitting on this last hot range is frequent, which results in periodical latency spikes as a range split blocks all writes at a time.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/7ecbbc31-7544-4c7a-bebc-
+fa7b9d9e6b16/partitioning.png)
+
+Fig 1. Sequential keys require a different partitioning scheme.
+
+To cater to sequential write workloads, CRDB offers the hash-sharded
+table/secondary index. It works by selecting a hash range based on the hash of
+the primary/index key. As long the keys produce a uniform distribution of
+keys, the writes are uniformly distributed across the hash ranges, and the
+records of the same key go to the same hash range. While this solves the
+problem of a hot range for writes, it also reduces the efficiency of some
+reads, as logical locality (adjacent rows according to the primary key) are no
+longer physically co-located requiring KV operations to be spread out over
+more nodes.
+
+### Range splits
+
+Whether a range is a contiguous block of keyspace or a contiguous block of
+hash space makes no difference to the splitting, merging and movement of
+ranges. In all cases, one range is one Raft group.
+
+A range can be split because either it gets too large or it exceeds the
+queries per second threshold for splits. However, splitting a range can also
+result in worse performance, therefore, heuristics are applied to assess
+whether the split would result in a net gain in performance. The heuristics
+assess the following:
+
+  * Is there a split point such that the load will be relatively balanced across the two ranges? If all load is going to a single key, then a split will not help.
+
+  * How many queries will still need to cross both ranges? If all queries are range scans and will have to scan each range in any case, then the additional overhead of reading from two ranges instead of one makes the split a net loss.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/9c9d9a81-7694-4585-81b3-0f37559c18e7/split_point.png)
+
+Fig 2. Does there exist a split point such that it results in a net gain in
+performance?
+
+Splitting a range into a left-hand (LHS) and right-hand (RHS) range sounds
+like it might be expensive, considering that we’re splitting one Raft group
+into two groups. However, a split is relatively lightweight, the critical
+section of the split is a metadata operation executed as a Raft command that
+reassigns ownership of the LHS/RHS keyspans.
+
+Think of a split as each replica of the given range dividing in half, in
+place, so no data movement takes place. Moreover, the Raft log itself does not
+need to be split in two and the key/value data of the original range is stored
+in the Pebble instance, outside of Raft.
+
+Once a range has been split, either the leaseholder balancing or the load-
+based replica rebalancing can take advantage of the finer-grained ranges.
+
+### Range merges
+
+To merge two ranges, first, the replicas must be co-located on the same
+storage nodes via a move operation. Once co-located, the merge operation is
+also lightweight for similar reasons to split. The RHS is destroyed and the
+LHS assumes the end range key of the RHS.
+
+### Range moves
+
+A move could mean moving one replica or all replicas of a range.
+
+A range may be moved for multiple reasons:
+
+  * Two ranges are getting merged but are not co-located on the same nodes.
+
+  * Load-based replica rebalancing moves one or more replicas from an overloaded node to a less loaded node.
+
+  * Other reasons such as a node getting decommissioned.
+
+Moving a range involves removing one or more replicas and adding one or more
+replicas, in an operation known as a reconfiguration. CRDB uses Raft’s Joint
+Consensus reconfiguration algorithm which supports arbitrary replica changes
+(including a new completely disjoint set of replicas). This is a two-phase
+member reconfiguration where the first phase consists of both the old and new
+membership configurations in play and requires both to make progress. This
+phase is known as joint consensus. It is initiated by the leader appending an
+“old-new config” command to its log with the details of the old and new
+configurations. This operation gets replicated as any other log operation does
+in Raft, though now also to the new members. New followers need to catch up
+fast and this can be done via a snapshot if the log is too large. The leader
+can still append normal operations during this process - that is, the cluster
+remains online and operational throughout. The difference is that while in
+this joint consensus phase, the commit index and leader elections can only
+make progress based on a majority in both the old and new membership
+configurations.
+
+Once the “old-new” operation has been committed in both membership
+configurations, the leader appends a “new config” operation, and once that has
+been committed in the new configuration, the reconfiguration process is
+committed.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/7ac83cdd-652b-449f-8caa-88fe15291c1d/joint_consensus.png)
+
+Fig 3. CRDB implements Raft reconfiguration to move replicas.
+
+Adding a cold replica to the Raft group could increase commit latencies as it
+would not initially be able to participate in the majority quorum for writes
+(due to it lagging behind). This latency impact would be extremely notable for
+moves which involve a disjoint old and new membership, as a majority of the
+new configuration is required for entries to get committed and the new members
+would start empty. For this reason, CRDB adds new replicas first as learners
+(replicas which act as non-voting members which cannot serve any requests)
+which must catch-up to the leader before the reconfiguration is initiated.
+This makes the joint consensus operation itself fast and avoids latency
+impacts from new replicas.
+
+The most costly aspect of moving a range is that the range’s data stored in
+Pebble must be transferred to another node. A snapshot encompassing the range
+to be moved must be generated on the original node, transmitted, and installed
+on the target node.
+
+## Auto-scaling the SQL layer
+
+Each tenant is served by an elastic pool of SQL pods which can scale from zero
+to a large number of pods. CRDB serverless uses network security rules to
+ensure that only SQL pods of the same tenant can communicate with each other.
+This SQL layer is stateless and any tenant connection can be served by any SQL
+pod of that tenant, there is no stateful routing at this layer. This makes
+scaling simply a matter of detecting demand and autoscaling the pods to match
+that demand. One tenant may need less than one vCPU and another may need
+hundreds: the autoscaler is responsible for ensuring that each tenant has what
+it needs, even scaling to zero when a virtual cluster becomes idle. Because
+the layer is stateless, this scaling can be performed quickly. The shared
+storage layer never scales down and is always ready to serve KV requests from
+the SQL layer.
+
+> “A key requirement of scaling up is speed. While scaling down is usually
+> done when there isn’t much pressure on the system, scaling up is in stark
+> contrast. Cluster expansion needs to complete as fast as possible before the
+> system risks becoming overloaded” [Kora
+> paper](https://www.vldb.org/pvldb/vol16/p3822-povzner.pdf).
+
+The autoscaler has a number of priorities to balance:
+
+  * Respond quickly to sudden demand to ensure that tenant queries do not get rejected or experience high latencies.
+
+  * Scale down when demand drops below the current provisioned capacity (to reduce costs).
+
+  * Ensure stability by not triggering scaling actions too frequently.
+
+The autoscaler bases its decisions on average and max CPU utilization (across
+the SQL pods of the tenant) over a sliding 5 minute window. It sets an over-
+provisioned baseline CPU threshold based on the average CPU with an additional
+buffer. This baseline is used to calculate the number of SQL pods needed to
+service the average load, with some spare capacity per pod for instant
+bursting. When the max CPU exceeds this over-provisioned baseline, the
+autoscaler increases the calculated SQL pod count. It aims to balance the
+needs for sudden demand that requires rapid scaling, with a slower moving
+average.
+
+After calculating a new ideal SQL pod count, it triggers a Kubernetes
+reconciliation process to bring about the change, whether it be adding or
+removing pods. Spikes in CPU can cause the autoscaler to respond immediately.
+
+As stated above, scaling up/out generally needs to be fast in order to cope
+with sudden changes in demand. For this reason, CRDB Serverless keeps a spare
+pool of ready-to-go SQL pods that can get “stamped” with a tenant and begin
+serving queries within a matter of milliseconds.
+
+Scaling down does not need to be so sudden and here CRDB Serverless
+prioritizes stability. When reducing the number of SQL pods, a SQL pod goes
+through a draining process before being terminated. The draining process
+allows for current connections to get closed as a natural course of how
+applications interact with CRDB, and the proxy layer can also migrate
+connections from a draining pod to another pod without impacting the
+application at the other end of the connection.
+
+If load drops to zero then eventually the autoscaler will suspend the tenant,
+terminating all its SQL pods. The moment another connection arrives, the proxy
+layer will trigger the stamping of a standby pod and route the new connection
+to that pod.
+
+# Conclusions
+
+What I find fascinating about this serverless data system series is that we
+can take two OLTP SQL database systems - but see wildly different designs
+behind the endpoints. Neon and Serverless CockroachDB are so very different
+because, although they are both OLTP database systems, they were architected
+for very different objectives.
+
+Neon architected for a serverless “Just Postgres” experience, giving users the
+confidence that they are getting the tried and trusted Postgres (with storage
+tweaks), but with the durability and cost benefits of a large-scale, multi-
+tenant shared storage layer. The more economical storage layer also unlocked
+new capabilities of non-overwriting storage which allows for historical reads
+and snapshots opening up new use cases.
+
+CockroachDB was architected for scale beyond a single server and globally
+distributed databases. It had to be distributed and horizontally scalable from
+day one. Serverless CRDB was just a small step further, as many of the needed
+ingredients were already in place: Admission control, sharding (range
+splitting, merging and moving), and rebalancing (leaseholder balancing and
+load-based replica balancing). It just needed a little separation of storage
+and compute, smart proxies and some extensions to include tenants into the
+shared storage layer.
+
+For some teams that just needed a small car to do the weekly trip to the
+supermarket and commute, CRDB may have seemed like the Ferrari that was
+overkill for their needs. Serverless CRDB opens up many new use cases, from a
+low cost free tier, to many small databases to globally distributed databases.
+Serverless CRDB is still missing some of the features of single-tenant
+dedicated clusters that many enterprise customers demand, but the Cockroach
+team are working on closing those gaps and envisage that the serverless plan
+will also serve its more demanding customers in the future.
+
+There is a lot more to CockroachDB than I’ve covered here. I didn’t even touch
+on the depths of consistency protocol and the query engine which are both
+large, interesting and complex topics by themselves. A good place to start to
+learn more is the [CockroachDB: The Resilient Geo-Distributed SQL
+Database](https://dl.acm.org/doi/pdf/10.1145/3318464.3386134) paper.
+
+Chapter 4 parts:
+
+  * [Part 1 - Architecture overview](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-1)
+
+  * [Part 2 - Admission control](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-2)
+
+  * [Part 3 - Heat management and autoscaling](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-3)
+

@@ -1,0 +1,275 @@
+Analysis parts: [Analysis intro](https://jack-
+vanlightly.com/analyses/2022/12/20/vr-revisited-an-analysis-with-tlaplus),
+[part1](https://jack-vanlightly.com/analyses/2022/12/20/paper-vr-revisited-
+view-change-questions-part1), [part 2](https://jack-
+vanlightly.com/analyses/2022/12/12/22/paper-vr-revisited-view-change-answers-
+part2), [part 3](https://jack-vanlightly.com/analyses/2022/12/28/paper-vr-
+revisited-state-transfer-part-3), [part 4](https://jack-
+vanlightly.com/analyses/2023/01/01/paper-vr-revisited-application-state-and-
+commit-number-monotonicity-part-4), [part 5](https://jack-
+vanlightly.com/analyses/2023/01/17/paper-vr-revisited-log-based-replica-
+recovery-part-5).
+
+In part 5 we looked at basic and log-suffix recovery and came to the
+conclusion that perhaps a persistent State Machine Replication (SMR) protocol
+should not use asynchronous log flushing with a recovery protocol for
+recovering from data loss - at least not one that gets stuck after a cluster
+crash. Checkpoint based recovery doesn’t change that position but it does
+introduce a very important component of any SMR protocol - checkpointing
+application state.
+
+What is checkpointing and why is checkpointing so important?
+
+Checkpoints are snapshots of the state managed by the state machine. The log
+itself only exists in order to maintain multiple copies of a state machine and
+its underlying state. We’ll use the term application state to match the paper.
+It is the state machine (or application) and its application state that we
+truly care about. The log is a means to that end. Given that application state
+is usually multiple orders of magnitude smaller than the log, it can be
+attractive as a means of synchronization in some circumstances.
+
+When we might want to synchronize using checkpoints:
+
+  * There are scenarios where a replica can be so far behind that the size of the log that needs replicating is prohibitively large. The size of the state that the state machine manages can be many orders of magnitudes smaller than the underlying log itself. So in these situations it makes sense to synchronize a stale replica using the application state, rather than the log.
+
+  * Logs can’t always grow forever, we often need to garbage collect the tail of the log to prevent it growing too large. There are scenarios where a replica becomes so far behind that its log head is part of the garbage collected tail of the primary. There is no way to use log synchronization alone to catch-up the stale replica. Instead, a snapshot (or checkpoint) of the application state is transferred.
+
+Once the checkpoint has been transferred and applied, the replica switches
+back to log replication.
+
+VR Revisited explains how this checkpointing can be done.
+
+> Every O operations the replication code makes an upcall to the application,
+> requesting it to take a checkpoint; here O is a system parameter, on the
+> order of 100 or 1000. To take a checkpoint the application must record a
+> snapshot of its state on disk; additionally it records a checkpoint number,
+> which is simply the op-number of the latest operation included in the
+> checkpoint.
+
+Because checkpointing occurs on a periodic basis, synchronization will
+virtually always require the combination of a checkpoint plus a small log
+suffix.
+
+The paper next describes a two step recovery process:
+
+> When a node recovers, it first obtains the application state from another
+> replica.
+>
+> …
+>
+> After the recovering node has all the application state as of the latest
+> checkpoint at the node it is fetching from, it can run the recovery
+> protocol. When it runs the protocol it informs the other nodes of the
+> current value of its state by including the number of the checkpoint in its
+> RECOVERY message. The primary then sends it the log from that point on.
+
+The checkpoint recovery actions in our pseudo-TLA+ look as follows:
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/c88ec2ec-f3e1-4db7-a8d7-6f40687e8161/CheckpointRecoveryActions.png)
+
+Fig 1. Checkpoint recovery actions
+
+Actions:
+
+  *  **Crash** \- A replica crashes and restarts with a non-deterministic prefix of its log and application state missing some corresponding number of operations. The replica switches to Recovering status, non-deterministically chooses a peer and sends a GetCheckpoint request to it.
+
+  *  **ReceiveGetCheckpointRequest** \- A replica, in any status but Recovering, receives a GetCheckpoint request and responds with a NewCheckpoint response which contains a non-deterministically stale copy of its app_state. This specification does not include active checkpointing to limit the state space, instead we pick some arbitrary checkpoint position when a checkpoint is requested.
+
+  *  **ReceiveNewCheckpointResponse** \- A replica in Recovering status receives a NewCheckpoint response and writes the checkpoint to its application state, sets its op and commit-numbers to the checkpoint number and garbage collects its log up to the checkpoint number. Checkpoint recovery does not include any synchronization of the log-prefix up to the checkpoint number - so in order to prevent log divergence we must garbage collect it. Next the replica broadcasts a Recovery request, including the checkpoint number.
+
+  *  **ReceiveRecoveryRequest** \- A replica in the Normal status receives a recovery request and if it is a primary, it responds with its view-number, the log suffix beginning at the checkpoint-number+1, op-number, commit-number and the field `x`. If it isn’t a primary, then it responds only with the view-number, a nil log-suffix and the field `x`.
+
+  *  **ReceiveRecoveryResponse** \- A replica in status Recovering receives a recovery response with a value of `x` that matches the unique number it is expecting. It adds the response to a set of received responses.
+
+  *  **CompleteRecovery** \- A replica in status Recovering has received a recovery response from a majority of replicas and one response is from a primary in the highest view of the responses received. The replica appends the log-suffix to its log and sets its view-number, op-number, commit-number etc to that of the response from the valid primary. Finally it switches to the Normal status. It is now a fully functioning member of the cluster and can participate in all cluster operations.
+
+What if the checkpoint the replica receives is more stale than the one it has
+already? This would actually make the replica worse off. I’m not going to
+explore that issue here.
+
+The important thing to note is that the log-prefix that is covered by the
+received checkpoint is suspect and so needs to be garbage collected to avoid
+log divergence.
+
+The above actions are not quite correct though as we are not taking into
+account log prefix garbage collection.
+
+## Impact of log garbage collection
+
+Many sub-protocols are affected by log garbage collection. Where before the
+entire log was always available - now prefixes of the log may not be present.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/b4520c37-8b85-4d4b-b4f1-767af4dbac93/GarbageCollectedPrefix.png)
+
+Fig 2. The log of replica 1 is entirely within the garbage collected log
+prefix of replica 2. Replica 1 cannot obtain operation 3 and execute it.
+
+Many operations now need to include checkpoint synchronization as there simply
+may not be the log entries required for state transfer or a view change which
+involves log-suffix synchronization only.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/640be2cf-3eff-4d78-9335-d7e6cb6ab20e/CheckpointTransfer.png)
+
+Fig 3. The general approach to synchronizing using checkpoints, instead of
+replicating log entries alone.
+
+This affects view changes, state transfer and replica recovery.
+
+ **View changes**
+
+I still haven’t applied any optimization to view changes. So far we are still
+transmitting the entire log in DoViewChange and StartView messages! The
+equivalent of this with checkpoints and partially garbage collected logs is
+for replicas to send a checkpoint and log-suffix in DoViewChange and StartView
+messages, rather than only the log. On sending and receiving the StartView
+message, the replica overwrites its application state with the checkpoint,
+replaces its log with the log suffix (deleting the prefix) and executes any
+operations above the checkpoint-number and the new commit-number. This is as
+close as we can get to the equivalent of full log sync with checkpoints.
+
+This sorely needs optimization.
+
+ **State transfer**
+
+When a replica receives a GetState message, the op-number of the message may
+exist in the garbage collected prefix. In those cases the replica must perform
+checkpoint based synchronization instead of sending a log-suffix alone. In
+this specification it simply sends a checkpoint and the corresponding log-
+suffix in the NewState message.
+
+ **Recovery**
+
+Even after a replica has synchronized its application state with a peer, when
+the primary receives the Recovery message, the op-number of the message may
+exist in the garbage collected prefix.
+
+The paper discusses this possibility:
+
+> …when a recovering node runs the recovery protocol, the primary might have
+> just taken a checkpoint, and if it immediately discarded the log prefix
+> reflected in that checkpoint, it would be unable to bring the recovering
+> replica up to date without transferring application state. A large enough
+> suffix of the log should be retained to avoid this problem.
+
+Keeping a large enough log suffix will help reduce the likelihood of such an
+event, but it won’t stop it from happening completely. The primary may have
+itself just gone through recovery and have deleted it’s log prefix, or the
+peer that was chosen to fetch the checkpoint from may have been very stale
+itself.
+
+In the case that the op-number exists in the garbage collected prefix, the
+replica sends back the latest checkpoint and log-suffix in the Recovery
+response.
+
+DoViewChange and StartView messages always contain a checkpoint. NewState and
+RecoveryResponse messages will either contain only a log-suffix, or a log-
+suffix and a checkpoint.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/554811b9-8455-4f7b-a954-4c608acdac7a/OtherMsgsWithCheckpoints.png)
+
+Fig 4. Other messages may also now contain a checkpoint.
+
+Therefore we need to modify our now obviously incorrect ReceiveRecoveryRequest
+and CompleteRecovery actions to include possible checkpoint synchronization.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/a9393797-4aba-4b25-8032-5c0ae08baa99/CorrectedActions.png)
+
+Fig 4. Recovery actions modified to handle checkpoint synchronization when a
+required portion of a log is missing due to log garbage collection.
+
+Notice that the replica will likely receive a message that contains a
+checkpoint with a checkpoint-number lower than the commit-number. In that
+case, after the replica has overwritten its application state it must execute
+any unexecuted operations, bringing the application state up to this commit-
+number.
+
+Going back to the issue of needing to keep a larger suffix than is strictly
+necessary in order to avoid the need for checkpoint synchronization. One way
+of keeping a larger suffix is for the replica that is sending the log-suffix
+to send a larger suffix. If it needs to send a suffix starting at op-number
+1000 then it could send the suffix starting at 900 instead - creating this
+extra buffer for avoiding the need for checkpoint synchronization. This
+specification does not do this as we are only concerned with safety and also
+with liveness issues that would cause a cluster to get stuck.
+
+## Conclusions
+
+For the purposes of our specification, this is a rather simplistic model where
+entire checkpoints are embedded in messages. An implementation might use a
+trick like the Merkle trees discussed in the paper which would be more complex
+than simply passing an entire checkpoint in a message. But for our purposes of
+validating the correctness of a high level design, this will suffice.
+
+View changes are also badly in need of optimization as this simplistic model
+has many problems.
+
+Firstly, every view change causes the log-prefix (prior to the checkpoint) to
+be deleted for safety reasons, increasing the chances that future
+synchronization requires checkpoints. This problem can be mitigated by sending
+a larger suffix as previously discussed.
+
+Secondly, every view change can cause previously executed operations to be re-
+executed as we are always starting from checkpoints which are inherently
+stale. This re-execution isn’t a problem unless there are external side-
+effects such as making an HTTP call. Of course, repeating external side
+effects is always a risk during view changes in any case, but this type of re-
+execution based on a checkpoint makes it much worse.
+
+Finally, synchronizing a checkpoint on each view change is more expensive than
+is required. I may explore view change optimizations in the future and any
+implementer will of course have to do so.
+
+The specification is already way larger than I would normally write. The state
+space at this point is getting crazy and we’re past the limits of what I can
+usefully brute-force model check on my workstation. With a small model of
+three replicas, two view changes, one crash and a single operation with 28 CPU
+threads and 100GB of RAM dedicated to TLC, I had to abort brute force checking
+after 41 hours. In that time it discovered 3.6 trillion unique states. I had
+to abort it because it reached 650GB of disk space used and I only have 700GB
+available for TLC. Simulation mode is now my only option and as the state
+space grows ever larger the confidence in simulation finding something drops.
+With reconfiguration and view change optimization still to do, the state space
+will grow yet further and it grows exponentially. I may be forced to check the
+spec without all sub-protocols included at the same time.
+
+In any case, after many days of simulation, I have found no defects with the
+checkpoint-based recovery. The only issue is the one I highlighted in part 5 -
+that of clusters getting stuck after cluster crashes. This itself could be
+fixed by modifying the recovery protocol to detect when normal recovery is
+impossible and fall back to a recovery that might include some potential data
+loss. I won’t explore that in this analysis though.
+
+Next up is reconfiguration. I’ve been looking forward to this and I haven’t
+read that portion of the paper at all yet.
+
+The specification for checkpoint-based recovery is
+[here](https://github.com/Vanlightly/vsr-tlaplus/blob/main/vsr-
+revisited/paper/analysis/06-replica-recovery-cp/VR_REPLICA_RECOVERY_CP.tla).
+
+Analysis parts: [Analysis intro](https://jack-
+vanlightly.com/analyses/2022/12/20/vr-revisited-an-analysis-with-tlaplus),
+[part1](https://jack-vanlightly.com/analyses/2022/12/20/paper-vr-revisited-
+view-change-questions-part1), [part 2](https://jack-
+vanlightly.com/analyses/2022/12/12/22/paper-vr-revisited-view-change-answers-
+part2), [part 3](https://jack-vanlightly.com/analyses/2022/12/28/paper-vr-
+revisited-state-transfer-part-3), [part 4](https://jack-
+vanlightly.com/analyses/2023/01/01/paper-vr-revisited-application-state-and-
+commit-number-monotonicity-part-4), [part 5](https://jack-
+vanlightly.com/analyses/2023/01/17/paper-vr-revisited-log-based-replica-
+recovery-part-5).
+

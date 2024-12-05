@@ -1,0 +1,239 @@
+In [part 1](https://jack-vanlightly.com/analyses/2024/4/24/understanding-
+apache-hudi-consistency-model-part-1) we built up an understanding of the
+mechanics of Hudi Copy-on-write tables, with a special regard to multi-writer
+scenarios, using a simplified logical model. In this part we’ll look at:
+
+  * Understanding why the Hudi spec instructs the use of monotonic timestamps, by looking at the impact of timestamp collisions.
+
+  * The probability of collisions in multi-writer scenarios where writers use their local clocks as timestamp sources.
+
+  * Various options for avoiding collisions.
+
+Again, to be repetitive, the v5 Hudi spec says that it is the responsibility
+of the implementation to ensure timestamps are monotonic. Non-monotonic
+timestamps violate the spec. Even so, let’s understand the impact of timestamp
+collisions between multiple writers anyway. Forearmed is forewarned.
+
+# The impact of timestamp collisions
+
+A timestamp collision occurs when two separate operations use the same
+timestamp. If a timestamp collision were left uncontrolled, it would result in
+timeline and file group files getting overwritten. If the file/object storage
+supports a PutIfAbsent operation, then timestamp collisions are prevented
+altogether at the storage layer. S3 does not support PutIfAbsent (at the time
+of writing) and therefore collisions must be avoided by obtaining a non-
+colliding timestamp.
+
+Here are two examples of unchecked collisions causing trouble.
+
+## Overwriting the completed instant in the timeline
+
+Operation 1 completes successfully, but operation 2 uses the same timestamp.
+It then proceeds to write a different key that maps to a different file group,
+and finishes by overwriting the completed instant of operation 1, which now
+points to a file slice in file group 2. The original committed file slice of
+operation 1 is now unreadable and left an orphan, to be cleaned up by table
+services at a later time.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/8752a20a-2163-4fa1-a027-01f02201ccf1/collision_trace1.png)
+
+Fig 1. A completed instant in the timeline gets overwritten, orphaning a
+committed file slice.
+
+## Overwriting a file slice (optimistic locking)
+
+In this scenario, operation 2 again uses the same timestamp as operation 1.
+This time it is writing to the same file group as operation 1. It overwrites
+the file slice, but then fails the concurrency control check. While it never
+wrote the completed instant, we still have a consistency violation. The
+completed instant of operation 1 now points to the uncommitted data of the
+failed operation 2.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/ae0dc33a-df9f-4394-a6be-692c5bca8e26/collision_trace2.png)
+
+Fig 2. A file slice gets overwritten, losing committed rows.
+
+PutIfAbsent avoids these issues by failing writes to a file that already
+exists with the same file name.
+
+Note! One potential gap in the PutIfAbsent guard rail is related to file
+slices. The file name of a file slice includes the Write Token (which so far I
+have left out) and forms part of its unique identity. The Write Token is a
+counter which forms part of the file name and is incremented on each attempt
+by a writer to write the file. Each retry increments the write token. If the
+first write were to fail due to a connection failing, then the writer would
+attempt a second write with WriteToken=2. This second write could succeed even
+if another writer had, in the meantime, written a file with the same original
+file name (with a write token of 1).
+
+# Probability of timestamp collisions
+
+When writers use their local OS clock as a timestamp source (which violates
+the v5 Hudi spec), what are the chances of timestamp collisions in multi-
+writer scenarios?
+
+We can look to the Birthday Paradox for intuition.
+
+>  _“In probability theory, the birthday problem asks for the probability
+> that, in a set of n randomly chosen people, at least two will share a
+> birthday. The birthday paradox refers to the counterintuitive fact that only
+> 23 people are needed for that probability to exceed 50%.”_[
+> https://en.wikipedia.org/wiki/Birthday_problem](https://en.wikipedia.org/wiki/Birthday_problem)
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/fbfead1b-a685-4877-8cf7-20c80531e4d6/birthday_probem.png)
+
+Wikipedia goes on to explain:
+
+>  _“The birthday paradox is a veridical paradox: it seems wrong at first
+> glance but is, in fact, true. While it may seem surprising that only 23
+> individuals are required to reach a 50% probability of a shared birthday,
+> this result is made more intuitive by considering that the birthday
+> comparisons will be made between every possible pair of individuals. With 23
+> individuals, there are 23 × 22/2 = 253 pairs to consider, far more than half
+> the number of days in a year.”_
+
+The same principle applies to timestamp collisions among multiple writers
+which use their local clocks as timestamp sources. To understand the
+probabilities, I wrote a simple Python script. For each writer, it generates a
+sequence of timestamps based on a requested write interval (with a small
+amount of jitter) over a duration of time. Next, it does a set union of all
+the writer sequences to calculate the number of collisions.
+
+I ran the following experiments, each combination was run 1000 times, with
+mean, min and max collisions calculated, as well as the probability of 1 or
+more collisions:
+
+  1. 2-20 writers, 1 minute write interval, over a 24 hour period.
+
+  2. 2-20 writers, 5 minute write interval, over a 24 hour period.
+
+  3. 5 writers, 1-20 minute write interval, over a 24 hour period.
+
+  4. 5 writers, 1-20 minute write interval, over a 7 day period.
+
+Note that none of the charts show a perfectly smooth curve as the results are
+based on a simulation run 1000 times (enough to show the trend but not enough
+to create a perfect curve).
+
+## 2-20 writers, 1 minute write interval, over a 24 hour period.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/40fec586-3077-48e0-9ffd-
+aab12d341653/collisions1.png)
+
+Fig 1. We see that with 1 minute intervals (+/- 3 seconds jitter), we see the
+same S-curve as the birthday paradox. The probability reaches above 50% in a
+24-hour period with 8 writers and asymptotes towards 100%.
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/38139ad8-20e8-4055-9bda-368a87650c42/collisions2.png)
+
+Fig 2. Across the 1000 simulations, the average reaches 1 collision at 9-10
+writers. The max tops out at 14 collisions at 20 writers.
+
+## 2-20 writers, 5 minute write interval, over a 24 hour period.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/e8a63b77-ba2d-4425-bb97-d5592ffae152/collisions3.png)
+
+Fig 3. Increasing the write interval to 5 minutes (+/- 15 seconds) lowered the
+probability significantly.
+
+## 5 writers, 1-20 minute write interval, over a 24 hour period
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/cd6a3535-8721-49ee-9672-14a8ba826cbc/collisions4.png)
+
+Fig 4. We see that the probability of a collision over a 24 hour period drops
+off quickly as the write interval increases. The curve is not perfect due to
+this being a simulation with a 1000 runs.
+
+## 5 writers, 1-20 minute write interval, over a 7 day period  
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/ad5370d2-f11d-4903-93f7-c9a1311ef700/collisions5.png)
+
+Fig 5. Increasing the duration to 7 days naturally increases the probability
+of a collision.
+
+What is clear from these charts is that timestamp collisions are more common
+than you might at first expect and that collision avoidance is critical.
+
+# Avoiding collisions
+
+There are many ways of avoiding timestamp collisions in multi-writer
+scenarios. We are not starved of options.
+
+  1. Use a storage system that supports PutIfAbsent (S3 does not offer this at the time of writing).
+
+  2. Use a monotonic timestamp source such as an OLTP database, DynamoDB or even an Apache ZooKeeper counter. There are many databases that are capable of generating monotonic numbers.
+
+  3. Use a salt in all instant and file slice filenames, such as a UUID (Delta Lake does this technique to avoid checkpoint collisions).
+
+I was told of the idea of a salt by a Hudi PMC member and I immediately added
+salt support to the TLA+ specification. When two instants or file slices
+collide on timestamp, they are discerned and sorted by their salt.
+
+If you are using a single writer, a collision could only occur if you used the
+local non-monotonic clock, had two serial operations that occurred in quick
+succession, and the clock went backwards before the second operation causing a
+collision. This is avoidable using the monotonic clock in Linux.
+
+# Similarities to Delta Lake
+
+Delta Lake log record IDs, just like Hudi timestamps, must be monotonic. The
+Delta Lake VLDB paper [Delta Lake: High-Performance ACID Table Storage over
+Cloud Object Stores](https://www.vldb.org/pvldb/vol13/p3411-armbrust.pdf)
+discusses the need for avoiding log ID collisions.
+
+> Amazon S3 does not have atomic “put if absent” or rename operations. In
+> Databricks service deployments, we use a separate lightweight coordination
+> service to ensure that only one client can add a record with each log ID.
+> This service is only needed for log writes (not reads and not data
+> operations), so its load is low.” Section 3.2 Access Protocols, Delta Lake:
+> High-Performance ACID Table Storage over Cloud Object Stores.
+
+This lightweight coordination service uses locks (or some equivalent to
+produce a critical section) to ensure that two writers cannot perform the
+optimistic concurrency check at the same time and both write the commit record
+to the log with the same record ID. On other storage systems, such as Azure
+Data Lake Storage, such a service is not required, just as with Apache Hudi.
+
+# Next steps
+
+So far we’ve reviewed a simplified logical model of Apache Hudi COW tables and
+built an understanding for why timestamps need to be monotonic. The [TLA+
+specification](https://github.com/Vanlightly/table-formats-
+tlaplus/tree/main/hudi/v5_spec/basic_cow) is ready. What will model checking
+tell us about the claimed ACID guarantees of Hudi? Also, will it answer the
+question from [part 1](https://jack-
+vanlightly.com/analyses/2024/4/24/understanding-apache-hudi-consistency-model-
+part-1) about monotonically issued timestamps whose operations are executed
+out of order? That is all covered in part 3 where we look at the results of
+model checking the TLA+ specification.
+
+Series links:
+
+  * [Part 1 - Building a logical model of Copy-On-Write tables.](https://jack-vanlightly.com/analyses/2024/4/24/understanding-apache-hudi-consistency-model-part-1)
+
+  * [Part 2 - Timestamp monotonicity.](https://jack-vanlightly.com/analyses/2024/4/24/understanding-apache-hudi-consistency-model-part-2)
+
+  * [Part 3 - Modeling checking the TLA+ specification.](https://jack-vanlightly.com/analyses/2024/4/25/understanding-apache-hudi-consistency-model-part-3)
+

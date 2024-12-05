@@ -1,0 +1,362 @@
+In the last [post](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-
+redpanda-performance-part-1-4-vs-50-producers) we saw that Redpanda
+performance degraded significantly by running the same 1 GB/s throughput via
+50 producers and consumers instead of 4. In this post we’ll see the results of
+running the 1 GB/s benchmark for a longer time period with the original 4
+producers - the sweet spot for Redpanda.
+
+# Running the benchmark for 24 hours
+
+Unfortunately I hit a bug in OMB with the 24 and 36 hour tests which prevented
+me from obtaining the statistics json files. I have since added a fix for the
+bug but for the purposes of this post the Grafana dashboards do a good enough
+job of showing the issues I found.
+
+### The First 12 Hours
+
+Putting it simply, running the 1 GB/s throughput, over 288 partitions and 4
+producers and consumers led to significant degradation in Redpanda performance
+over time. It took 12 hours for the degraded end-to-end latencies to manifest.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/486bcc2c-c51d-4e70-ad19-191744f1023c/rp-
+long-running-p50.png)
+
+Fig 1. Redpanda p50-p90 end-to-end latencies jump after 12 hours.
+
+We see the same pattern in the tail latencies, though to a much larger degree,
+with 25 second latencies reported.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/506ee70c-1288-41a7-9cde-b9bb91174bf4/rp-
+long-running-p95.png)
+
+Fig 2. The Redpanda tail latencies shoot up massively after 12 hours.
+
+End-to-end latency significantly increases in the higher percentiles. The p99
+measurements hit 3.5s, while p99.99 goes as high as 26s. These are only the
+scraped percentiles based on 10 second windows, which are far smaller than the
+final percentile results for the whole multi-hour test.
+
+Did you notice that there’s also a stepwise increase in latency just before
+20:00? There’s more going on under the hood, but we’ll get to that in an
+upcoming post.
+
+So what’s going on?
+
+Each time I run the test I see the same pattern. In another case with the same
+latency pattern, we see internal RPC latency between brokers go up.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/c3ab1047-3305-4212-b893-24a2218dacb6/rp-
+long-running-rpc-latency.png)
+
+Fig 3. Redpanda reports increasing inter-broker latencies midway through the
+24 hour test.
+
+The IO subsystem metrics indicate some kind of saturation, as the internal_rpc
+latency significantly increases, the number of requests in the IO queue
+increase from 0 to 1000s, and as total time spent queued similarly starts to
+hit 500 to 1k ops.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/c0b1e095-4f70-4017-8775-4b0171ba533b/rp-
+long-running-io-queue-metrics.png)
+
+Fig 4. Indicators of saturation.
+
+From the metrics, it appears that there may be an issue with the NVMe drive in
+keeping up with the workload. Time to look at the previous metrics but per
+instance rather than as a cluster as a whole.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/f5ea31a9-6d51-4672-808d-a73c762a4694/rp-
+long-running-starving-disk.png)
+
+Fig 5. Redpanda-1 starts reporting being “starved for disk”.
+
+It looks like broker redpanda-1(light blue) has a problem and redpanda-0
+(yellow) also is starting to show some performance issues, with some more
+minor peaks.
+
+Redpanda-1 saw a big jump in individual write and read completion time
+starting around 10:00.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/5691e760-8539-43f1-8132-f92ce6e55ffa/rp-
+long-running-rp1-disk-latency.png)
+
+Fig 6. Redpanda-1 NVMe drive read and write latency increases markedly.
+
+Meanwhile, redpanda-0 is also showing signs of extra drive latency, with
+similar spikes in its individual write and read completion times.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/b5c4e458-7674-44a7-b240-72e058cd194c/rp-
+long-running-rp0-disk-latency.png)
+
+Fig 7. Redpanda-0 also seeing increased NVMe drive latency.
+
+Redpanda-2 seems ok for now, with a baseline 50-60 microsecond write latency
+that Redpanda seems to exhibit on this hardware when it's not too stressed.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/b6ec4860-c330-4e8b-b2fb-
+be8035a4ddad/rp-long-running-rp2-disk-latency.png)
+
+Fig 8. Redpanda-2 shows healthy NVMe drive latency.
+
+### The Next 12-24 Hours
+
+Letting the test continue for an additional 12 hours we begin to see further
+degradation in latency. The following graphs show the individual write and
+read completion times for each broker across a 36-hour period.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/60635bd6-d2b3-4742-8b11-a558b76fb64f/rp-
+long-running-rp0-disk-latency-36hr.png)
+
+Fig 9. Redpanda-0 NVMe drive latency over 36 hours.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/33b8b29e-ef9a-4472-9862-fc41a393d622/rp-
+long-running-rp1-disk-latency-36hr.png)
+
+Fig 10. Redpanda-1 NVMe drive latency over 36 hours.
+
+Redpanda-2 now starts having issues too.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/f2007109-3359-48a1-bf92-08f2f77839ba/rp-
+long-running-rp2-disk-latency-36hr.png)
+
+Fig 11. Redpanda-2 NVMe drive latency over 36 hours.
+
+The NVMe drive slow down started on one broker but within a matter of hours it
+was affecting all brokers. By the end of the 24 hour run, I was seeing 3
+second p99 and 25 second p99.99 end-to-end latencies (10 second windows),
+which vary significantly from the results on the shorter 1 hour tests
+(p99=11ms, p99.99 =30ms). I ran this test three times on three separate
+hardware deployments, once to 36 hours and twice to only 24 hours - the
+slowdown repeated on all three runs. Given that it occurred at around the 12
+hour mark on all three test runs, on completely different deployments, I am
+satisfied that this is a totally reproducible behavior with this workload and
+hardware.
+
+After some analysis it is clear that the early performance was based on the
+NVMe drives still being relatively empty, with low NVMe GC overhead. Over time
+SSD drives start needing to perform housekeeping operations such as garbage
+collection and wear leveling. As the drive filled up, more and more GC was
+required which started impacting drive read and write latency. More on that
+further down. Through data retention policy I had left 25% of the drive empty
+throughout the test, which is a pretty standard amount.
+
+While Redpanda deteriorated over time, I saw that Kafka actually improved over
+time. The p50 end-to-end latency didn’t show any strong signal but the p99 and
+p99.99 latencies show marked improvement.
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/fd6ea9c0-6db2-43e0-8ace-0615d7dc3b6f/kafka-
+long-running-p50.png)
+
+Fig 12. Kafka p50 end-to-end latencies for a 24 hour period.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/43382444-7611-4cf8-bbb1-478c51b5d2ea/kafka-
+long-running-p99.png)
+
+Fig 13. Kafka p99 end-to-end latencies for a 24 hour period.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/f738869f-4b10-43d4-be25-1a3f4c72d993/kafka-
+long-running-p9999.png)
+
+Fig 14. Kafka p99.99 end-to-end latencies for a 24 hour period.
+
+This is a somewhat unfortunate pattern for Kafka which can show its worst
+results in the first hours of load as it doesn’t make for good benchmark
+results - few people leave Kafka to warm up for a few hours before collecting
+results.
+
+# It’s time to talk about random IO vs sequential IO
+
+As I wrote about recently in my blog post “[Is sequential IO dead in the era
+of the NVMe drive?](https://jack-vanlightly.com/blog/2023/5/9/is-sequential-
+io-dead-in-the-era-of-the-nvme-drive)”, even high performance NVMe drives do
+better with sequential IO. Sequential IO reduces the need for the drive to
+perform GC which in turn extends the lifetime of the drive and keeps the drive
+performance high. When it comes to mechanical sympathy, sequential IO is just
+as beneficial to SSDs and as it is to HDDs.
+
+There is a continuum with sequential IO on one side and random IO on the
+other. If we look at three event streaming servers: Apache BookKeeper (used by
+Apache Pulsar), Apache Kafka and Redpanda, we would see that BookKeeper is
+firmly in the sequential IO side, Apache Kafka is in the middle and Redpanda
+is more to the random IO side.
+
+What makes BookKeeper sequential is that all of its data is written to a
+single active Write-Ahead-Log (WAL) file located on one disk. Data from
+multiple topics is interleaved in the WAL. Data is written a second time for
+long-term read-optimized storage, again with only one active file at a time,
+located on another disk. In both cases writes are purely sequential. Reads are
+not quite as sequential but pretty good. We could say that BookKeeper is truly
+built for modern storage hardware as it writes and reads with a sequential IO
+pattern.
+
+Apache Kafka sits somewhere in the middle of the spectrum. Kafka maps each
+partition to an active segment file, resulting in much more granularity than
+BookKeeper. Given that our test has 288 partitions, we have a corresponding
+288 files being actively written to at a time. But Kafka relies on the OS to
+flush large amounts of data to disk as it sees fit, leading to larger
+sequential writes that span multiple blocks.
+
+Redpanda sits the closest to the random IO side. While it too uses the same
+partition-to-active-segment model as Kafka, it uses direct IO and submits
+writes in small 16 KiB chunks with IO merging disabled rather than let the OS
+flush it asynchronously. What we’ve seen in this long running test is that
+writing small chunks to 288 different files very frequently causes significant
+drive fragmentation, causing the NVMe drive GC process to become the
+bottleneck.
+
+Empirically, I have never in my time seen this form of drive degradation with
+BookKeeper despite running it in production on the very same kind of NVMe
+drives. Neither did I see this degradation in Kafka during my 24 and 36 hour
+tests. It seems that this is Redpanda specific and likely due to their small
+writes and need to fsync across many files.
+
+## NVMe drive Over-provisioning (OP)
+
+But of course, I did not employ any drive over-provisioning for this
+benchmark, partly because the existing automation did not do so. EC2 local
+instance store volumes come with 0% OP. Over-provisioning is a way of making
+NVMe drives maintain their performance over time and increase their lifespan.
+Basically it means reserving a portion of the drive purely for housekeeping
+purposes like GC. Enterprise grade SSDs that you buy will come with a certain
+percentage of OP built-in however AWS does not include any OP in its local
+NVMe drives. If you carefully read the AWS storage optimized instances docs,
+AWS advises leaving 10% of a drive unpartitioned (and therefore unwritable by
+the OS) to act as OP space for the drive controller.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/1de04861-ab95-46da-8113-eee55aa4397d/ec2-op-
+docs.png)
+
+<https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/storage-optimized-
+instances.html>
+
+(Don’t get drive over-provisioning mixed up with the Redpanda over-provisioned
+flag, they are unrelated. That flag is related to running Redpanda in Docker).  
+  
+The Redpanda OMB automation did not include this 10% unpartitioned space, so I
+added this to the Ansible script in my OMB repo. You can set the partition end
+% with the _partition_percent_ variable.
+
+    
+    
+    - name: Create a new primary partition with % free (over-provisioning)
+     hosts: redpanda
+     tasks:
+     - parted:
+         device: '{  }'
+         number: 1
+         label: 'gpt'
+         flags: [ lvm ]
+         state: present
+         part_end: '{{ partition_percent | default(100) }}%'
+       loop: '{  }'
+    
+
+I ran the same “1GB/s, 4 producer, 288 partition” test again, with a data
+retention policy set to limit the disk size to 75% of total volume, to see if
+the 10% OP fixed the slow down problem. This time the slowdown started at
+around 24 hours instead of 12, which is better but still problematic. While I
+didn’t run further tests, I would assume at least 20% of a drive should be
+left unpartitioned, perhaps as high as 30-40% (you’ll have to test it for
+yourself). Exactly how much over-provisioning your drives need depends heavily
+on your workload. The more partitions you have, and higher load you have, the
+more random IO you’ll have, and the more write-amplification will occur over
+time. Given that at-scale production workloads tend to have many thousands of
+partitions, you may need to reserve a sizeable portion of your drive to
+accommodate GC.
+
+# Conclusions
+
+What does built for modern hardware really mean? In my opinion, built for
+modern storage drives means building a system that sits further on the left of
+the sequential/random IO continuum, and for a storage system like Apache Kafka
+et al, storage and networking are where the most important optimizations lie.
+
+It is telling, after having run Apache BookKeeper in production in the cloud
+with local NVMe drives, I have never seen NVMe drive slowdowns necessitating
+over-provisioning. Likewise, in my two months of benchmarking Apache Kafka, no
+long running test, even the stress tests saw the need for over-provisioning.
+Yet Redpanda did. Databases also [require over-
+provisioning](https://docs.aerospike.com/server/operations/plan/ssd/ssd_op)
+and it comes down to the fact that many databases are random IO heavy by their
+nature. Random IO doesn’t come for free, and just because a system relies on
+the ability of a drive to perform random IO it doesn’t mean it’s a better
+architecture. It’s trade-offs all the way down.
+
+I highly recommend running benchmarks for a long time so that you can catch
+some of these issues that you won’t see in a short benchmark.
+
+# How to run this test
+
+In your OMB workload file, simply set _testDurationMinutes_ to _1440_ for 24
+hours or a higher value if you want to confirm that a higher OP configuration
+is effective for Redpanda.
+
+Note that at the time of writing, my fix that is necessary when running these
+longer tests is not in the main OMB repo. You can follow the steps in my copy
+of the OMB [here](https://github.com/Vanlightly/openmessaging-benchmark-
+custom/tree/main/blog/kafka-vs-rp/part2-long-running).
+
+[Next up](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-
+performance-part-3-hitting-the-retention-limit) we’ll talk about that little
+stepwise increase in latency we saw in one of those Grafana dashboards -
+hitting the data retention limit.
+
+Series links:
+
+  * [Kafka vs Redpanda performance - Do the claims add up?](https://jack-vanlightly.com/blog/2023/5/15/kafka-vs-redpanda-performance-do-the-claims-add-up)
+
+  * [Kafka vs Redpanda performance - Part 1 - 4 vs 50 producers](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-1-4-vs-50-producers)
+
+  * Kafka vs Redpanda performance - Part 2 - Long running tests
+
+  * [Kafka vs Redpanda performance - Part 3 - Hitting the retention limit](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-3-hitting-the-retention-limit)
+
+  * [Kafka vs Redpanda performance - Part 4 - The impact of record keys](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-4-impact-of-record-keys)
+
+  * [Kafka vs Redpanda performance - Part 5 - Reaching the NVMe drive limit](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-5-reaching-the-limits-of-the-nvme-drive)
+
+  * [Kafka vs Redpanda performance - Part 6 - Draining backlogs](https://jack-vanlightly.com/analyses/2023/5/15/kafka-vs-redpanda-performance-part-6-draining-backlogs)
+

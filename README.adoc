@@ -1,0 +1,94 @@
+= Web Article Downloader
+:toc:
+:toc-placement!:
+:source-highlighter: highlight.js
+
+A Python script to automatically download, process, and archive articles from Jack Vanlightly's Analyses in multiple formats (text, EPUB, and MOBI).
+
+toc::[]
+
+== Features
+
+* Downloads all articles from the specified blog
+* Extracts article content, titles, and publication dates
+* Sorts articles in reverse chronological order (newest first)
+* Generates multiple output formats:
+** Plain text files (one per article)
+** EPUB ebook
+** MOBI ebook (requires Calibre)
+* Robust error handling and logging
+* Multiple fallback strategies for content extraction
+
+== Prerequisites
+
+* Python 3.11 or higher
+* pip (Python package installer)
+* Calibre (for MOBI conversion)
+
+=== Installing Calibre
+
+==== macOS
+[source,bash]
+----
+brew install --cask calibre
+----
+
+==== Other Operating Systems
+Download and install Calibre from https://calibre-ebook.com/download
+
+== Installation
+
+1. Clone or download this repository:
+[source,bash]
+----
+git clone <repository-url>
+cd <repository-directory>
+----
+
+2. Create and activate a virtual environment:
+[source,bash]
+----
+python -m venv .venv
+source .venv/bin/activate  # On macOS/Linux
+# or
+.venv\Scripts\activate     # On Windows
+----
++
+
+3. Install required Python packages:
+[source,bash]
+----
+pip install -r requirements.txt
+----
+
+== Usage
+
+Run the script with default settings:
+[source,bash]
+----
+python script.py
+----
+
+The script will:
+
+1. Download articles from Jack Vanlightly's blog
+2. Create a `downloaded_articles` directory
+3. Save individual articles as text files
+4. Generate an EPUB file containing all articles
+5. Convert the EPUB to MOBI format
+
+== Output
+
+All downloaded content will be saved in the `downloaded_articles` directory:
+
+* Individual `.txt` files for each article
+* `Downloaded Articles.epub` - Combined EPUB ebook
+* `Downloaded Articles.mobi` - Combined MOBI ebook
+
+== Contributing
+
+Feel free to submit issues and enhancement requests!
+
+== License
+
+This project is licensed under the MIT License - see the LICENSE file for details.

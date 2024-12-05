@@ -1,0 +1,580 @@
+_This post is based on Apache Iceberg v2._
+
+[ Apache Iceberg](https://iceberg.apache.org) is the last table format I am
+covering in this series and is perhaps the most widely adopted and well-known
+of the table formats. I wasn’t going to write this analysis originally as I
+felt the book _Apache Iceberg: The Definitive Guide_ was detailed enough. Now,
+having gone through the other formats, I see that the book is too high-level
+for what I have been covering in this series—so here we go—a deep dive into
+Apache Iceberg internals to understand its basic mechanics and consistency
+model.
+
+If you want a high-level understanding of Iceberg, I highly recommend the
+book: _Apache Iceberg: The Definitive Guide_. If you want to learn more about
+the internals of the read and write path in more detail than books and most
+other blogs, then read on.
+
+# The Mechanics of Apache Iceberg
+
+Like all table formats, Iceberg is both a specification and a set of
+supporting libraries. The specification standardizes how to represent a table
+as a set of metadata and data files. Iceberg also defines a protocol for how
+to manipulate those files while safeguarding data consistency - this protocol
+is not fully documented in the specification but exists in the Iceberg code
+itself.
+
+An Iceberg table’s files are split between a metadata layer and a data layer,
+both stored in an object store such as S3. The difference with Iceberg is that
+commits are performed against a catalog component.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/e29f02a5-d407-4622-b7f6-cfc2f43c5629/CatalogMetadataAndDataFilesSmall.png)
+
+Fig 1. A writer writes metadata that references data files and commits the
+metadata’s location to a catalog.
+
+Each write creates a new snapshot which represents a version of the table at
+that point in time. The snapshot forms a tree of files that a compute engine
+can read to learn of all the files that make up the table. The files under a
+snapshot are:
+
+  * The manifest-list file, which contains one entry per manifest file, indicating its file path and some other metadata.
+
+  * One or more manifest files. Each manifest file contains one or more entries that reference a set of data files - one entry for one data file.
+
+  * One or more data files (Parquet/ORC/Avro).
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/8804b4c7-ebc5-4415-8193-75b52a76d64d/SnapshotSmall.png)
+
+Fig 2. A snapshot forms a tree of files that make up the table at a point in
+time.
+
+Snapshots themselves are not files but are stored in a log of snapshots in the
+root file of the table metadata—known as the **metadata file—** which is, in
+turn, referenced by the catalog. Each write creates a new metadata file, which
+includes the new snapshot associated with the write.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/9d008d23-2fd5-4cd3-b5f5-fba19a82103d/MetadataFilesSmall.png)
+
+Fig 3. Each write operation creates a new metadata file that contains the new
+snapshot and all prior snapshots. Snapshots eventually must get expired to
+prevent the snapshot log growing to large.
+
+The catalog stores the location of the current metadata file, which contains
+all the metadata for all live snapshots of the table. A compute engine reads
+the current metadata file and can access any version of the table from there.
+
+A write operation is committed by performing a commit against the catalog,
+which is an atomic compare-and-swap (CAS) where the writer provides the
+current metadata file location and a new one that it has just written.
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/1360ef32-a4f0-43a0-847c-727445aa6fee/MetadataCommitSmall.png)
+
+Fig 4. Two writers performing a concurrent operation against the table attempt
+to perform the atomic CAS using the same original metadata location. The
+second commit is rejected. Note that metadata files are appended with a UUID
+to avoid collisions.
+
+This CAS operation forms part of the foundations for consistency in Apache
+Iceberg but is by no means the sole component.
+
+## A simple example of writing snapshots
+
+Let’s look at a simple example where three insert operations result in three
+snapshots. The table has a single column “fruit”.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/c1579123-31e5-4373-83c1-78d32bf22d07/ThreeInsertsSmall.png)
+
+Fig 5. Three insert operations result in three live snapshots (each
+representing a different table version).
+
+Notice that the final metadata file is metadata-3, which contains all three
+snapshots, and the manifest list of the third snapshot also contains all three
+manifest files. Metadata files get an integer suffix (representing the table
+version), but manifest and manifest list files do not have integer suffixes
+(as pictured here). This is just a simple logical view (integers are easier to
+read than long random file names).
+
+However, in Iceberg, we aren’t only adding data files; we might also be
+deleting files. Iceberg tracks both file additions and deletions via its
+manifest files.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/930e38a4-e17c-4a7a-a0ab-59ac7cdef4b0/InsertInsertDeleteSmall.png)
+
+Fig 6. Snapshot 3 only references manifest-2 and manifest-3, tracking the
+delete of data-1 in manifest-3.
+
+It’s worth understanding these ADDED and DELETED statuses in more detail so we
+can visualize how compute engines track added and deletes files.
+
+## Tracking file additions and deletions (in excruciating detail)
+
+All the table formats provide a way for compute engines to know what data
+files got added and removed across the various snapshots. Iceberg does this
+through its manifest files. On first read, it might not be clear, but
+hopefully with the diagrams, it will all make sense in the end.
+
+Each manifest file has (among other things):
+
+  * a field _added_in_snapshot_ , which identifies in which snapshot the manifest was added. 
+
+  * A list of manifest entries (one entry for one data file). Each entry has a status of either ADDED, EXISTING, or DELETED which applies in the context of the snapshot identified in the _added_in_snapshot_ field. 
+
+The manifest reader in the Iceberg library returns a logical version of each
+physical manifest. This logical version may have manifest entry status changes
+or even have some manifest entries filtered out altogether.
+
+For example:
+
+  * Any entries with status=ADDED of a manifest added in a prior snapshot get transformed to EXISTING.
+
+  * Any entries with status=DELETED of a manifest added in a prior snapshot get filtered out completely.
+
+If a write operation deletes any entries from the logical manifest, it is
+rewritten as a new manifest file as part of the write operation. Manifest
+files are immutable, so changes cause a new file to be written for the new
+version of the table. The original manifest will remain unchanged for the
+prior table versions to reference.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/630eb51a-f1b0-4d86-b8f1-1745488ac1c6/ManifestLifecycleExampleSmall.png)
+
+Fig 7. The lifecycle of a manifest file created in snapshot-2, read in
+snapshot-3 (to a logical version), has an entry deleted and finally gets
+written as a new manifest file in snapshot-4.
+
+Let’s look at an example across multiple snapshots:
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/7f0945e8-9ef8-41ea-9253-3d4e7ff4979e/AddedDeletedExistingMultipleSnapshotsSmall.png)
+
+Fig 8. Manifest files across 5 snapshots.
+
+  1. Snapshot-1 adds data-1 and data-2. 
+
+    1. Manifest-1 is written with data-1 and data-2 as ADDED.
+
+    2. The new manifest-list is: [manifest-1].
+
+  2. Snapshot-2 deletes data-1. 
+
+    1. Manifest-1 is affected by data-1's deletion. The manifest is written as a new file, manifest-2, with data-1's status changed to DELETED, data-2's status as EXISTING, and _added_in_snapshot_ =2.
+
+    2. The new manifest-list is: [manifest-2].
+
+  3. Snapshot-3 adds data-3. 
+
+    1. Manifest-3 is created with data-3 as ADDED.
+
+    2. Manifest-2 had no changes made to the files so it remains the same. 
+
+    3. The new manifest-list is: [manifest-2, manifest-3].
+
+  4. Snapshot-4 deletes data-2. 
+
+    1. Manifest-2 is affected by this delete so the manifest is written as a new file, manifest-4, with data-2 as DELETED and data-1 not included at all (as it was deleted in snapshot 2).
+
+    2. Manifest-3 is unaffected and is not rewritten.
+
+    3. The new manifest-list is: [manifest-3, manifest-4].
+
+  5. Snapshot-5 adds data-4.
+
+    1. Manifest-3 is unaffected and so is not rewritten.
+
+    2. Manifest-4 contains only a single DELETED entry and therefore is not included in this new snapshot.
+
+    3. Manifest-5 is written with data-4 as ADDED.
+
+    4. The new manifest-list is: [manifest-3, manifest-5].
+
+This may be more detail than you ever wanted, but I found myself needing to
+understand all this to get a good fix on how compute engines can track which
+files were added and removed in each snapshot.
+
+# Copy-on-write and merge-on-read
+
+Iceberg has two table modes for dealing with row-level updates such as DELETE,
+MERGE, and UPDATE commands in SQL:
+
+  * Copy-on-write: row-level modifications cause data files to get rewritten.
+
+  * Merge-on-read: row-level modifications cause new files to be written which must be merged on read.
+
+Note that you can configure UPDATE, DELETE and MERGE operations separately to
+use COW or MOR. You could for example, use MOR for updates and deletes, but
+COW for merge. This means that a table is not COW or MOR, but could be a mix
+of the two.
+
+## Copy-on-write (COW)
+
+With copy-on-write mode, any operations that either update a row or delete a
+row in a data file cause the whole data file to be rewritten.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/052b3ea1-7d14-47bc-9168-9c13c0d1f447/CopyOnWriteSmall.png)
+
+Fig 9. data-1 gets completely rewritten as data-2 due to a single row being
+updated.
+
+This results in the following metadata:
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/c4646688-8904-4a10-965c-c2d0c1aa08a4/CowMetadataSmall.png)
+
+Fig 10. The copy-on-write operation results in a new snapshot where data-1 has
+been deleted and data-2 has been added.
+
+Copy-on-write is great for read efficiency but can be problematic for update
+heavy workloads, due to the large write amplification that comes with
+rewriting entire data files when a subset of rows must be changed.
+
+## Merge-on-read - position deletes
+
+Iceberg v2 introduced merge on read (MOR) with two variations: position
+deletes and equality deletes. The idea behind merge-on-read is for row-level
+updates and deletes to only add news files and not rewrite anything. This
+avoids the write-amplification of copy-on-write.
+
+Position deletes work by logically deleting rows that have been invalidated by
+either a delete or an update operation, by adding delete files that reference
+the data file and the ordinal position of the invalidated row. Using the
+example from before, the UPDATE results in the following:
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/ec9c81d1-0399-43e2-882e-143addd9e71f/MergeOnReadPositionDeletesSmall.png)
+
+Fig 11. data-1 remains in place in the new table version, with the new value
+written to data-2 and the original row invalidated by a delete file.
+
+A reader loads the delete files first and then the data files. The data reader
+simply skips any rows that have been referenced in a delete file.
+
+With the addition of delete files, I should now introduce some changes to the
+metadata:
+
+  * Manifest files either contain data files or delete files. Each manifest file contains a “content” field which is either set to 0 (DATA) or 1 (DELETES).
+
+  * The manifest list file indicates whether each manifest file in its list is a data or a delete manifest.
+
+Data and delete files are separated into dedicated manifest files so that
+compute engines can load delete files first before scanning data files.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/9cc1fede-f5b0-48cf-9dcc-e71f5bad4cc6/MergeOnReadPosDeletesMetadataSmall.png)
+
+Fig 12. The merge-on-read operation results in a new snapshot where data-1,
+data-2 and delete-1 are all members of the new table version.
+
+Merge-on-read with position deletes solves the write amplification of COW
+tables while still offering relatively efficient reads. Skipping rows based on
+the file path and ordinal position is cheap, though the number of delete files
+should be kept in check via compaction (more on that later).
+
+## Merge-on-read - Equality deletes
+
+One problem with position deletes is that the compute engine must know the
+data files and positions of the rows to be deleted. Another option is to
+specify an equality predicate and let readers filter rows based on those
+predicates. This can make a write much cheaper as there is no need for a prior
+read or to manage some kind of local cache with information on matching data
+to file paths and row positions. The disadvantage is that reads become a lot
+more expensive as readers must evaluate each row against all valid equality
+deletes. Aggressive compaction is recommended to keep the number of equality
+deletes low (more on compaction soon).
+
+Using the example UPDATE again we get the following:
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/847f579d-ef02-4cf5-8d81-a85ba13411ca/MergeOnReadEqualityDeletesSmall.png)
+
+Fig 13. The same set of files as position deletes, only that the delete file
+entry is an equality delete.
+
+Equality deletes are used in combination with sequence numbers which are also
+new in Iceberg v2. Each snapshot gets a monotonically increasing sequence
+number which applies to any added data or delete files of that snapshot.
+
+I’ll discuss sequence numbers in more depth in part 2, when I cover the
+consistency model itself. For now, just remember that sequence numbers
+determine the scope of the data files that an equality delete applies to. Any
+row of a data file with a higher sequence number than that of an equality
+delete will not get filtered.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/8a4c177c-fd5c-4761-a9fc-b26e8bf47b18/MergeOnReadEqualityDeletesMetadataSmall.png)
+
+Fig 14. The same metadata as with position deletes except that this diagram
+includes the sequence numbers and the delete file contains an equality delete.
+
+# Compaction
+
+Compaction is the rewriting of many small files as fewer, larger files. There
+are two types of compaction: data compaction and manifest compaction.
+
+The goals of data file compaction are:
+
+  * Reducing file counts:
+
+    * Reduce the number of data files that must be loaded during reads.
+
+    * Reduce the number of delete files that must be applied during reads.
+
+  * Improving data locality:
+
+    * Apply data clustering to make reads more efficient.
+
+Compaction is not typically performed over an entire table at a time, as the
+table is often too large for this. Instead, compaction jobs run periodically
+and cover a time period, such as the last hour.
+
+## Reducing file counts
+
+If delete files are not regularly cleaned up, the costs of reads will keep
+increasing as the number of delete files increases.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/50252a19-6385-4967-b0db-70bbbbe2168f/CompactionSmallpng.png)
+
+Fig 15. Compaction rewrites data-1, data-2 and delete-1 as data-3.
+
+Compaction takes the input data and delete files and rewrites them as new data
+files.
+
+### Data locality via sorting/clustering
+
+Compute engines perform query planning based on file statistics, such as the
+min/max column values in a file. These file statistics are maintained in the
+manifest files, which allows query planners to base the plan purely on
+metadata files. When data is written without any regard for sorting across
+data files, the file statistics may not be very helpful - the physical layout
+and distribution of data are important. However, when data is sorted across a
+set of files, file statistics can be leveraged by compute engines to perform
+more aggressive data file pruning. Pruning is the concept of pruning out a
+subset of files from a query plan by identifying which data files cannot
+contain data relevant to a query (and hence don’t need to be read at all).
+
+As an example, imagine two sets of files that contain the Name and
+FavoriteColor columns; one set has no ordering across files and the other set
+is sorted by the Name column.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/37abf2eb-
+ab52-46dd-b7d2-0e35888336fe/ClusteringSmall.png)
+
+Fig 16. Data is unordered across files on the left, but sorted across files on
+the right leading to better query performance that can prune more files.
+
+The sorted files have min/max values that are useful to a query planner. If a
+query used the predicate WHERE Name = ‘jack’, the planner would know that only
+one data file from the set on the right could contain a matching row. However,
+the planner would determine that any of the files on the left could contain
+matching rows and all would need to be loaded and scanned.
+
+## Iceberg compaction strategies
+
+With the above in mind, Apache Iceberg has three compaction strategies:
+
+  * Bin-pack: 
+
+    * Efficient compaction.
+
+    * Reads do not benefit from data clustering.
+
+  * Sort:
+
+    * More costly compaction.
+
+    * Reads benefit from clustering.
+
+  * Z-Ordering:
+
+    * Most costly compaction.
+
+    * Reads benefit from the most effective clustering.
+
+I was tempted to write more detail about compaction strategies, but these
+posts are really focused on Iceberg's consistency model, and compaction
+strategies are about performance, so we’ll won’t go further with compaction in
+this post.
+
+## Partitioning
+
+Compaction strategies allow users to cluster their data for better read
+performance, but it’s not the only way to do it. A table can be partitioned by
+one or more columns (and transforms) - known as the partition spec. The
+compute engine must write rows to data files according to the partition spec.
+This is one step beyond clustering-via-compaction as data of different
+partitions never mix at all.
+
+Iceberg makes a big deal of its transform-based partitioning which it calls
+hidden partitioning. The idea is that instead of forcing users to create a
+partitioning column, such as a column for storing the day of a timestamp
+column, you can use the _day(col)_ transform. Other time based transforms
+exist: _hour_ , _month_ , _year_. Users who write queries and filter based on
+the timestamp column don’t need to know or care that the table is partitioned
+based on the hour/day/month/year of that timestamp. The partition could change
+from hour-based to day-based without rewriting any data files or changing any
+queries. Other transforms are _truncate(col, length)_ which is basically a
+substring op, and _bucket(n, col)_ which uses a hash function to distribute
+data over _n_ buckets.
+
+Partition evolution is an interesting subject, and pretty simple conceptually.
+Because partitioning can be based on transforms, it is possible to evolve a
+partition spec to go from a more granular scheme to a coarser scheme without
+rewriting data files. For example, changing the partition spec from
+_hour(col)_ to _day(col)_ only requires rewriting metadata and no data files.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/f1e840a4-d027-497b-9e84-0748410e0312/PartitionEvolutionSmall.png)
+
+Fig 17. One table, two sets of data files with different partition specs.
+
+But in cases where you would have to rewrite files, you can instead choose to
+leave the current data under the old spec and apply the new partitioning spec
+to the new data. Compute engines will simply need to query one set of files
+based on the 1st partition spec and the one set of files with the 2nd
+partition spec. This avoids the need to rewrite large amounts of data.
+
+# A simple logical model of the write path, with concurrency control
+
+Apache Iceberg supports multiple concurrent writers, with configurable
+Serializable or Snapshot isolation levels. We’ll cover concurrency control and
+conflict detection in great detail in part 2 (coming soon), so in this part,
+we’ll just take a high-level look at the write path and concurrency control.
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/76bd69c6-0fdc-414e-ada8-25cce30f0cec/WritePathSmall.png)
+
+Fig 18. Simplified model of an Iceberg write.
+
+If you’ve read the [Apache Hudi](https://jack-
+vanlightly.com/analyses/2024/4/24/understanding-apache-hudi-consistency-model-
+part-1) and [Delta Lake](https://jack-
+vanlightly.com/analyses/2024/4/29/understanding-delta-lakes-consistency-model)
+posts, you’ll see that the steps are very similar at a high level. Data files
+are written first, and then the process of writing and trying to commit
+metadata files takes place. A write will succeed if there is no data conflict
+and no metadata commit conflict.
+
+Iceberg differs from Hudi and Delta Lake in the specifics, which we’ll cover
+in detail in part 2. For now, I’ll point out the following:
+
+  1. Data conflict checks are performed before trying to commit, and Delta Lake and Hudi perform them only after a snapshot conflict.
+
+  2. Iceberg is not affected by the availability (or not) of PutIfAbsent in the object store. Delta Lake and Hudi commit by writing a snapshot file with a predictable name to the log (Delta Log / Timeline). Multiple writers could overwrite each other without PutIfAbsent or a lock. Iceberg writes the metadata file with a UUID in the name (in addition to the table version), which prevents metadata file overwrites. Writers also commit the new metadata file by performing a commit against the catalog, which must perform an atomic compare-and-swap of the metadata file locations.
+
+The main difference between Iceberg and the other table formats in terms of
+the consistency model is the nature of its data conflict checks. Where Delta
+Lake and Hudi libraries take responsibility for performing the necessary data
+conflict checks, the core Iceberg library simply provides a number of checks
+for compute engines to use or not. It is up to the individual compute engine
+to apply these checks correctly. I *may* have found an issue with Apache
+Spark, which seems to not invoke all necessary checks in one type of
+operation. That [issue](https://github.com/apache/iceberg/issues/10720)
+remains open, so we’ll have to see if I’m right or not on that one. Whatever
+the case, compute engine authors will need to take special care of the data
+validation checks they enable in order to avoid data consistency anomalies.
+
+## Mapping COW and MOR operations to Iceberg code
+
+For anyone interested in reading Apache Iceberg code, a good place to start is
+the
+[Table](https://github.com/apache/iceberg/blob/main/api/src/main/java/org/apache/iceberg/Table.java)
+interface in the API module which offers a few different table write
+operations for a compute engine to use (among many more):
+
+  * [AppendFiles](https://github.com/apache/iceberg/blob/main/api/src/main/java/org/apache/iceberg/AppendFiles.java#L30) (API module)
+
+    * For simply adding new files.
+
+    * Comes with two implementations: [FastAppend](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/core/src/main/java/org/apache/iceberg/FastAppend.java#L41) and [MergeAppend](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/core/src/main/java/org/apache/iceberg/MergeAppend.java#L30). The FastAppend simply adds new manifest files to the snapshot, the downside here is that the number of manifest files will grow large without manifest file compaction. The MergeAppend adds new manifest files and additionally, performs merges of existing manifest files to keep the number of manifest files in check. Spark uses FastAppends for streaming and MergeAppend for batch writes whereas Flink uses MergeAppend for streaming writes.
+
+  * [OverwriteFiles](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/api/src/main/java/org/apache/iceberg/OverwriteFiles.java#L42) (API module)
+
+    * For copy-on-write operations that perform row-level changes (UPDATE, DELETE, MERGE).
+
+    * Implementation: [BaseOverwriteFiles](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/core/src/main/java/org/apache/iceberg/BaseOverwriteFiles.java#L31) (Core module).
+
+  * [RowDelta](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/api/src/main/java/org/apache/iceberg/RowDelta.java#L32) (API module)
+
+    * For merge-on-read operations that perform row-level changes (UPDATE, DELETE, MERGE).
+
+    * Implementation: [BaseRowDelta](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/core/src/main/java/org/apache/iceberg/BaseRowDelta.java#L27) (Core module).
+
+  * [RewriteFiles](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/api/src/main/java/org/apache/iceberg/RewriteFiles.java#L39) (API module)
+
+    * For compaction.
+
+    * Implementation: [BaseRewriteFiles](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/core/src/main/java/org/apache/iceberg/BaseRewriteFiles.java#L26) (Core module).
+
+The critical parts of the commit process are in the
+[commit](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L370)
+method of the
+[SnapshotProducer](https://github.com/apache/iceberg/blob/94d336ce01381116ce637121e8e59f440148847f/core/src/main/java/org/apache/iceberg/SnapshotProducer.java#L74)
+class.
+
+The Iceberg project has a number of modules, but the ones you’ll be most
+interested are the following:
+
+View fullsize
+
+![](https://images.squarespace-
+cdn.com/content/v1/56894e581c1210fead06f878/ccc1f717-4825-47a7-9cab-f5826c0fff18/IcebergModulesSmall.png)
+
+Fig 19. Some of the modules of the Apache Iceberg project. Note that some
+compute engine Iceberg adaptor modules are hosted in the compute engine’s
+repo, such as Trino’s [Iceberg
+plugin](https://github.com/trinodb/trino/tree/master/plugin/trino-
+iceberg/src/main/java/io/trino/plugin/iceberg).
+
+# Next
+
+Next we’ll dive into Iceberg at a lower level to better understand its
+consistency model in multi-writer scenarios.
+
+  * Part 1, this post, basic mechanics of Iceberg.
+
+  * (coming soon) Part 2, details of concurrency control and data conflict checks to allow Apache Iceberg to handle multiple concurrent writers correctly. 
+
+  * (coming soon) Part 3, summary of the formal verification work.
+
