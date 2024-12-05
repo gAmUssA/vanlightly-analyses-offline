@@ -22,3 +22,9 @@ venv.bak/
 # OS
 .DS_Store
 Thumbs.db
+
+# Project specific
+downloaded_articles/
+*.epub
+*.mobi
+*.txt
