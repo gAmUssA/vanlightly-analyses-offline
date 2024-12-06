@@ -344,4 +344,32 @@ if __name__ == "__main__":
     MAIN_URL = "https://jack-vanlightly.com/analysis-archive"
     OUTPUT_DIR = "downloaded_articles"
     
-    main(MAIN_URL, OUTPUT_DIR)
+    try:
+        main_content = fetch_page_content(MAIN_URL)
+        article_urls = extract_article_urls(main_content)
+        
+        articles = []
+        for url in article_urls:
+            try:
+                content = fetch_page_content(url)
+                soup = BeautifulSoup(content, 'html.parser')
+                title = soup.title.string if soup.title else "Untitled"
+                article_content = extract_article_content(soup)
+                articles.append((title, article_content))
+            except Exception as e:
+                logger.error(f"Error processing article {url}: {str(e)}")
+        
+        # Create EPUB with fixed filename
+        epub_path = create_epub(articles, output_dir=OUTPUT_DIR, title="jack_vanlightly_articles")
+        
+        if epub_path:
+            # Convert to MOBI with the same base filename
+            convert_epub_to_mobi(epub_path)
+            logger.info("Successfully created both EPUB and MOBI files")
+        else:
+            logger.error("Failed to create EPUB file")
+            exit(1)
+            
+    except Exception as e:
+        logger.error(f"Main process failed: {str(e)}")
+        exit(1)
