@@ -37,7 +37,9 @@ jobs:
 
       - name: Get current date
         id: date
-        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+        run: |
+          echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
 
       - name: Create Release
         id: create_release
@@ -45,7 +47,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: release-${{ steps.date.outputs.date }}
+          tag_name: release-${{ steps.date.outputs.date }}-${{ steps.date.outputs.timestamp }}
           release_name: Blog Articles ${{ steps.date.outputs.date }}
           draft: false
           prerelease: false
