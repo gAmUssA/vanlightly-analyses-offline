@@ -34,19 +34,22 @@ def fetch_page_content(url, max_retries=3, retry_delay=5):
                 raise
 
 def extract_article_urls(main_page_content, base_url="https://jack-vanlightly.com"):
-    """Extract article URLs from the main page"""
+    """Extract article URLs from the main page maintaining their original order"""
     soup = BeautifulSoup(main_page_content, 'html.parser')
     links = soup.find_all('a', href=True)
-    article_urls = set()  # Use set to avoid duplicates
+    article_urls = []  # Use list to maintain order
     
+    seen_urls = set()  # For deduplication while maintaining order
     for link in links:
         href = link['href']
         # Specifically look for analysis URLs
         if '/analyses/' in href or '/blog/' in href:
             full_url = href if href.startswith('http') else f"{base_url.rstrip('/')}/{href.lstrip('/')}"
-            article_urls.add(full_url)
+            if full_url not in seen_urls:
+                seen_urls.add(full_url)
+                article_urls.append(full_url)
     
-    return list(article_urls)
+    return article_urls
 
 def sanitize_filename(title):
     """Convert title to a safe filename"""
@@ -72,10 +75,10 @@ def create_epub(articles, output_dir="output", title="Downloaded Articles"):
         book.set_language('en')
         
         chapters = []
-        for i, (article_title, content) in enumerate(articles):
+        for i, (article_title, article_url, content) in enumerate(articles):
             chapter = epub.EpubHtml(title=article_title,
                                   file_name=f'chap_{i+1}.xhtml',
-                                  content=f"<h1>{article_title}</h1>{content}")
+                                  content=f"<h1>{article_title}</h1><p>Source: <a href='{article_url}'>{article_url}</a></p>{content}")
             book.add_item(chapter)
             chapters.append(chapter)
         
@@ -260,84 +263,75 @@ def save_article_text(title, content, output_dir="output"):
         return None
 
 def main(main_url, output_dir="output"):
-    logger.info(f"Starting article download from: {main_url}")
-    
+    """Main function to download and convert articles"""
     try:
         # Create output directory
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
         
-        # Fetch and parse main page
-        main_content = fetch_page_content(main_url)
-        article_urls = extract_article_urls(main_content)
+        # Fetch main page content
+        main_page_content = fetch_page_content(main_url)
+        if not main_page_content:
+            logger.error("Failed to fetch main page content")
+            return
         
-        logger.info(f"Found {len(article_urls)} articles")
+        # Extract article URLs
+        article_urls = extract_article_urls(main_page_content)
+        if not article_urls:
+            logger.error("No article URLs found")
+            return
         
-        # List to store articles with their dates
-        dated_articles = []
+        # Sort URLs by date (newest first)
+        sorted_urls = []
+        for url in article_urls:
+            try:
+                content = fetch_page_content(url)
+                if content:
+                    soup = BeautifulSoup(content, 'html.parser')
+                    date = extract_article_date(url, soup)
+                    sorted_urls.append((date if date else datetime.min, url))
+            except Exception as e:
+                logger.error(f"Error processing URL {url}: {str(e)}")
+                continue
+        
+        sorted_urls.sort(reverse=True)  # Sort by date, newest first
+        article_urls = [url for _, url in sorted_urls]  # Extract just the URLs
         
         # Process each article
-        for i, url in enumerate(article_urls, 1):
+        articles = []
+        for url in article_urls:
             try:
-                logger.info(f"Processing article {i}/{len(article_urls)}: {url}")
-                
-                # Fetch and parse article
-                article_content = fetch_page_content(url)
-                soup = BeautifulSoup(article_content, 'html.parser')
-                
-                # Extract article content and title
-                title, content = extract_article_content(soup)
-                if not title or not content:
-                    logger.error(f"Failed to extract content from {url}")
-                    continue
-                
-                # Extract article date
-                pub_date = extract_article_date(url, soup)
-                
-                # Convert HTML to text for plain text version
-                h = html2text.HTML2Text()
-                h.ignore_links = False
-                text_content = h.handle(content)
-                
-                # Save text version
-                filename = f"{sanitize_filename(title)}.txt"
-                text_path = output_dir / filename
-                with open(text_path, 'w', encoding='utf-8') as f:
-                    f.write(text_content)
-                logger.info(f"Saved text version: {text_path}")
-                
-                # Store article with its date
-                dated_articles.append((pub_date, title, content))
-                logger.info(f"Successfully processed: {title} (Published: {pub_date.strftime('%Y-%m-%d')})")
-                
+                content = fetch_page_content(url)
+                if content:
+                    soup = BeautifulSoup(content, 'html.parser')
+                    title, article_content = extract_article_content(soup)
+                    if title and article_content:
+                        articles.append((title, url, article_content))
+                        # Save article text for backup
+                        save_article_text(title, article_content, output_dir)
             except Exception as e:
                 logger.error(f"Error processing article {url}: {str(e)}")
                 continue
         
-        if not dated_articles:
+        if not articles:
             logger.error("No articles were successfully processed")
             return
         
-        # Sort articles by date in reverse chronological order (newest first)
-        dated_articles.sort(key=lambda x: x[0], reverse=True)
-        logger.info("Sorted articles in reverse chronological order (newest first)")
+        # Create EPUB file
+        epub_path = create_epub(articles, output_dir, "Jack Vanlightly Articles")
+        if not epub_path:
+            logger.error("Failed to create EPUB file")
+            return
         
-        # Create EPUB with sorted articles
-        logger.info("Creating EPUB file...")
-        articles_for_epub = [(title, content) for _, title, content in dated_articles]
-        epub_path = create_epub(articles_for_epub, output_dir=output_dir)
+        # Convert to MOBI
+        mobi_path = convert_epub_to_mobi(epub_path)
+        if not mobi_path:
+            logger.error("Failed to convert to MOBI")
+            return
         
-        if epub_path:
-            # Convert to MOBI
-            logger.info("Converting to MOBI format...")
-            mobi_path = convert_epub_to_mobi(epub_path)
-            if mobi_path:
-                logger.info(f"Successfully created MOBI file: {mobi_path}")
-            
-        logger.info("Download process completed")
+        logger.info("Successfully created EPUB and MOBI files")
         
     except Exception as e:
-        logger.error(f"Error in main process: {str(e)}")
+        logger.error(f"Error in main function: {str(e)}")
 
 if __name__ == "__main__":
     # You can customize these parameters
@@ -355,7 +349,7 @@ if __name__ == "__main__":
                 soup = BeautifulSoup(content, 'html.parser')
                 title = soup.title.string if soup.title else "Untitled"
                 article_content = extract_article_content(soup)
-                articles.append((title, article_content))
+                articles.append((title, url, article_content))
             except Exception as e:
                 logger.error(f"Error processing article {url}: {str(e)}")
         

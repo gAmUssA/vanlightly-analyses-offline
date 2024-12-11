@@ -7,20 +7,17 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: python:3.11-slim
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-
-      - name: Install Calibre
+      - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y calibre
+          apt-get update
+          apt-get install -y calibre
 
       - name: Install Python dependencies
         run: |
